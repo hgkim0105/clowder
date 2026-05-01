@@ -5,14 +5,21 @@ import type { CatState } from "./types";
 import { SPRITE_SHEET_URL } from "./types";
 import "./App.css";
 
-// "done" → idle after 3s, "scared" → idle after 2s
+const STATE_PRIORITY: CatState[] = ["working", "thinking", "scared", "done", "idle"];
+
+function dominantState(states: CatState[]): CatState {
+  for (const s of STATE_PRIORITY) {
+    if (states.includes(s)) return s;
+  }
+  return "idle";
+}
+
 function useDisplayState(rawState: CatState): CatState {
   const [state, setState] = useState<CatState>(rawState);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     if (timerRef.current) clearTimeout(timerRef.current);
-
     if (rawState === "done") {
       setState("done");
       timerRef.current = setTimeout(() => setState("idle"), 3000);
@@ -22,25 +29,10 @@ function useDisplayState(rawState: CatState): CatState {
     } else {
       setState(rawState);
     }
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-    };
+    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
   }, [rawState]);
 
   return state;
-}
-
-function CatSession({
-  state: rawState,
-  label,
-  spriteSheet,
-}: {
-  state: CatState;
-  label: string;
-  spriteSheet: HTMLImageElement | null;
-}) {
-  const displayState = useDisplayState(rawState);
-  return <Cat state={displayState} spriteSheet={spriteSheet} label={label} />;
 }
 
 export default function App() {
@@ -53,22 +45,12 @@ export default function App() {
     img.onload = () => setSpriteSheet(img);
   }, []);
 
-  const shortLabel = (cwd: string) => cwd.split("/").filter(Boolean).pop() ?? cwd;
+  const rawState = dominantState(sessions.map((s) => s.state as CatState));
+  const displayState = useDisplayState(rawState);
 
   return (
     <div className="app">
-      {sessions.length === 0 ? (
-        <div className="no-sessions">no sessions</div>
-      ) : (
-        sessions.map((s) => (
-          <CatSession
-            key={s.info.sessionId}
-            state={s.state}
-            label={shortLabel(s.info.cwd)}
-            spriteSheet={spriteSheet}
-          />
-        ))
-      )}
+      <Cat state={displayState} spriteSheet={spriteSheet} />
     </div>
   );
 }

@@ -5,12 +5,11 @@ import { ANIM_CONFIG, FRAME_SIZE, DISPLAY_SCALE } from "../types";
 interface CatProps {
   state: CatState;
   spriteSheet: HTMLImageElement | null;
-  label?: string;
 }
 
-const SPRITE_SIZE = FRAME_SIZE * DISPLAY_SCALE;
+const SPRITE_SIZE = FRAME_SIZE * DISPLAY_SCALE; // 96px
 
-export function Cat({ state, spriteSheet, label }: CatProps) {
+export function Cat({ state, spriteSheet }: CatProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const frameRef = useRef(0);
   const animRef = useRef<number>(0);
@@ -34,7 +33,7 @@ export function Cat({ state, spriteSheet, label }: CatProps) {
         lastTimeRef.current = timestamp;
         frameRef.current = (frameRef.current + 1) % config.frameCount;
 
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.clearRect(0, 0, SPRITE_SIZE, SPRITE_SIZE);
 
         if (spriteSheet) {
           ctx.imageSmoothingEnabled = false;
@@ -59,14 +58,11 @@ export function Cat({ state, spriteSheet, label }: CatProps) {
   }, [state, spriteSheet]);
 
   return (
-    <div className="cat-wrapper">
-      <canvas
-        ref={canvasRef}
-        width={SPRITE_SIZE}
-        height={SPRITE_SIZE}
-        className="cat-canvas"
-      />
-      {label && <div className="cat-label">{label}</div>}
-    </div>
+    <canvas
+      ref={canvasRef}
+      width={SPRITE_SIZE}
+      height={SPRITE_SIZE}
+      className="cat-canvas"
+    />
   );
 }
