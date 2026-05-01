@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is Clowder
 
-Clowder is a macOS menu bar app (Tauri + React) that displays an animated pixel-art cat in the system tray. The cat reflects the dominant state across all active Claude Code sessions: idle, thinking, working, done, or scared.
+Clowder is a macOS menu bar app (Tauri + React) that displays an animated pixel-art cat in the system tray. The cat has two states: idle (no active sessions) and working (one or more sessions processing). The more active sessions, the faster the walking animation.
 
 ## Commands
 
@@ -30,7 +30,7 @@ No test or lint commands are configured.
 
 ```
 ~/.claude/sessions/*.json          (Claude session metadata)
-~/.claude/clowder/state/*.json     (per-session state: idle/thinking/working/done/scared)
+~/.claude/clowder/state/*.json     (per-session state: idle/thinking/working/done/scared — app treats any non-idle as working)
         ↓
 watcher.rs  — polls both dirs every 300–500ms via notify crate
         ↓
@@ -45,20 +45,19 @@ macOS NSStatusItem  — displays animated cat in menu bar
 **Key design decisions:**
 - Display is entirely via `TrayIconBuilder` (NSStatusItem) — the webview window is hidden
 - `ActivationPolicy::Accessory` removes the Dock icon and app switcher entry
-- Dominant state priority: `working > thinking > scared > done > idle`
-- `done→idle` (3s) and `scared→idle` (2s) auto-revert are handled in the Rust animation loop, not the frontend
+- Only two display states: `idle` (all sessions idle) and `working` (any session non-idle)
+- Working FPS scales with active session count: 1→12fps, 2→16fps, 3+→20fps
 - `make_icon` auto-crops transparent padding from each sprite frame then scales to 64×64 for sharp retina rendering
 - Sprite sheet: `public/Cat Sprite Sheet.png`, 256×320px, 32×32px per frame, 8 cols × 10 rows
 
 **Sprite rows:**
 
-| State    | Row | Frames | FPS |
-|----------|-----|--------|-----|
-| idle     | 0   | 4      | 6   |
-| thinking | 1   | 4      | 8   |
-| working  | 4   | 8      | 12  |
-| scared   | 5   | 8      | 14  |
-| done     | 6   | 4      | 5   |
+| State   | Row | Frames | FPS              |
+|---------|-----|--------|------------------|
+| idle    | 0   | 4      | 6                |
+| working | 4   | 8      | 12 / 16 / 20     |
+
+FPS는 active 세션 수에 따라 1개=12, 2개=16, 3개+=20.
 
 **Source layout:**
 - `src-tauri/src/lib.rs` — tray setup, session/state management, animation loop

@@ -110,24 +110,24 @@ pub fn emit_update(
 }
 
 /// (row, frame_count, fps)
-fn anim_config(state: &str) -> (u32, u32, u64) {
+fn anim_config(state: &str, active_count: usize) -> (u32, u32, u64) {
     match state {
-        "idle"     => (0, 4, 6),
-        "thinking" => (1, 4, 8),
-        "working"  => (4, 8, 12),
-        "scared"   => (5, 8, 14),
-        "done"     => (6, 4, 5),
-        _          => (0, 4, 6),
+        "idle"    => (0, 4, 6),
+        "working" => {
+            let fps = match active_count {
+                0 | 1 => 12,
+                2     => 16,
+                _     => 20,
+            };
+            (4, 8, fps)
+        }
+        _         => (0, 4, 6),
     }
 }
 
-fn dominant_state(list: &[SessionWithState]) -> &'static str {
-    for &priority in &["working", "thinking", "scared", "done", "idle"] {
-        if list.iter().any(|s| s.state == priority) {
-            return priority;
-        }
-    }
-    "idle"
+fn compute_display_state(list: &[SessionWithState]) -> (&'static str, usize) {
+    let active = list.iter().filter(|s| s.state != "idle").count();
+    if active > 0 { ("working", active) } else { ("idle", 0) }
 }
 
 fn make_icon(sheet: &DynamicImage, row: u32, col: u32) -> TauriImage<'static> {
@@ -164,23 +164,21 @@ async fn animation_loop(
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut display_state = String::from("idle");
+    let mut active_count: usize = 0;
     let mut current_frame: u32 = 0;
     let mut last_frame_time = Instant::now();
-    let mut done_at: Option<Instant> = None;
-    let mut scared_at: Option<Instant> = None;
 
     eprintln!("[clowder] animation_loop started");
 
     // Initial render
-    let (row, _, _) = anim_config("idle");
+    let (row, _, _) = anim_config("idle", 0);
     let result = tray.set_icon(Some(make_icon(&sheet, row, 0)));
     eprintln!("[clowder] initial set_icon result: {:?}", result);
 
     loop {
         tick.tick().await;
 
-        // Compute raw dominant state
-        let raw = {
+        let (new_display, new_active) = {
             let sessions = session_map.lock().unwrap();
             let states = state_map.lock().unwrap();
             let list: Vec<SessionWithState> = sessions
@@ -194,45 +192,19 @@ async fn animation_loop(
                     }
                 })
                 .collect();
-            dominant_state(&list).to_string()
+            let (s, c) = compute_display_state(&list);
+            (s.to_string(), c)
         };
 
-        // done/scared auto-revert logic
-        let new_display = match raw.as_str() {
-            "done" => {
-                scared_at = None;
-                let t = done_at.get_or_insert(Instant::now());
-                if t.elapsed() >= Duration::from_secs(3) {
-                    done_at = None;
-                    "idle".to_string()
-                } else {
-                    "done".to_string()
-                }
-            }
-            "scared" => {
-                done_at = None;
-                let t = scared_at.get_or_insert(Instant::now());
-                if t.elapsed() >= Duration::from_secs(2) {
-                    scared_at = None;
-                    "idle".to_string()
-                } else {
-                    "scared".to_string()
-                }
-            }
-            other => {
-                done_at = None;
-                scared_at = None;
-                other.to_string()
-            }
-        };
-
-        let (row, frame_count, fps) = anim_config(&new_display);
+        let (row, frame_count, fps) = anim_config(&new_display, new_active);
 
         if new_display != display_state {
             display_state = new_display;
+            active_count = new_active;
             current_frame = 0;
             last_frame_time = Instant::now();
         } else {
+            active_count = new_active;
             let frame_dur = Duration::from_millis(1000 / fps);
             if last_frame_time.elapsed() >= frame_dur {
                 current_frame = (current_frame + 1) % frame_count;
@@ -316,7 +288,7 @@ pub fn run() {
             let menu = tauri::menu::Menu::with_items(app, &[&quit_item])?;
 
             // Initial idle frame
-            let (row, _, _) = anim_config("idle");
+            let (row, _, _) = anim_config("idle", 0);
             let initial_icon = make_icon(&sheet, row, 0);
 
             let tray = TrayIconBuilder::new()
