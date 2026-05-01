@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is Clowder
 
-Clowder is a macOS desktop overlay app (Tauri + React) that displays animated cat companions — one per active Claude Code session. Cats animate based on session state: idle, thinking, working, done, or scared.
+Clowder is a macOS menu bar app (Tauri + React) that displays an animated pixel-art cat in the system tray. The cat reflects the dominant state across all active Claude Code sessions: idle, thinking, working, done, or scared.
 
 ## Commands
 
@@ -34,30 +34,37 @@ No test or lint commands are configured.
         ↓
 watcher.rs  — polls both dirs every 300–500ms via notify crate
         ↓
-lib.rs      — updates SessionMap + StateMap (Arc<Mutex>), resizes window, emits "sessions-update" Tauri event
+lib.rs      — updates SessionMap + StateMap (Arc<Mutex>), emits "sessions-update" Tauri event
         ↓
-useSessions.ts  — calls get_sessions Tauri command on mount, subscribes to "sessions-update" events
+animation_loop (tokio task)  — reads maps every 50ms, computes dominant state,
+                               advances sprite frame, calls tray.set_icon()
         ↓
-App.tsx     — renders one <Cat> per session, manages auto-revert transitions (done→idle 3s, scared→idle 2s)
-        ↓
-Cat.tsx     — canvas-based sprite animation, 8 frames per row, FPS varies by state (5–14)
+macOS NSStatusItem  — displays animated cat in menu bar
 ```
 
 **Key design decisions:**
-- Session ID is hashed to deterministically assign a sprite (same session always gets the same cat color)
-- Window width is dynamically resized by Rust: `max(120, sessions * 108)` px; height is fixed at 120px
-- Window is transparent, always-on-top, skip-taskbar; positioned above the macOS dock with 80px margin
-- Sprite sheets have rows per state; frame offsets are stored in `sprite-offsets.json`
-- State transitions `done` and `scared` auto-revert to `idle` in the frontend (App.tsx), not in Rust
+- Display is entirely via `TrayIconBuilder` (NSStatusItem) — the webview window is hidden
+- `ActivationPolicy::Accessory` removes the Dock icon and app switcher entry
+- Dominant state priority: `working > thinking > scared > done > idle`
+- `done→idle` (3s) and `scared→idle` (2s) auto-revert are handled in the Rust animation loop, not the frontend
+- `make_icon` auto-crops transparent padding from each sprite frame then scales to 64×64 for sharp retina rendering
+- Sprite sheet: `public/Cat Sprite Sheet.png`, 256×320px, 32×32px per frame, 8 cols × 10 rows
+
+**Sprite rows:**
+
+| State    | Row | Frames | FPS |
+|----------|-----|--------|-----|
+| idle     | 0   | 4      | 6   |
+| thinking | 1   | 4      | 8   |
+| working  | 4   | 8      | 12  |
+| scared   | 5   | 8      | 14  |
+| done     | 6   | 4      | 5   |
 
 **Source layout:**
-- `src-tauri/src/lib.rs` — Tauri commands, session/state management, window resizing
+- `src-tauri/src/lib.rs` — tray setup, session/state management, animation loop
 - `src-tauri/src/watcher.rs` — file system polling for session and state directories
-- `src/hooks/useSessions.ts` — IPC bridge between Tauri backend and React
-- `src/components/Cat.tsx` — canvas animation renderer
-- `src/App.tsx` — session list, sprite loading, state transition timers
-- `src/types.ts` — shared TypeScript types (`CatState`, `SessionInfo`, animation config)
-- `src/sprite-offsets.json` — per-frame pixel offsets for each sprite sheet
+- `src/hooks/useSessions.ts` — IPC bridge (unused in tray mode, kept for future use)
+- `src/types.ts` — shared TypeScript types and animation config
 
 ## Runtime File Paths
 
@@ -68,6 +75,8 @@ Cat.tsx     — canvas-based sprite animation, 8 frames per row, FPS varies by s
 
 ## Tauri / macOS Notes
 
-- `macOSPrivateApi: true` is required in `tauri.conf.json` for the transparent always-on-top overlay to work
+- `macOSPrivateApi: true` is required in `tauri.conf.json`
 - The Rust crate produces both `staticlib` and `cdylib` (required by Tauri)
-- Before `tauri dev` runs, it starts the Vite dev server automatically (configured in `tauri.conf.json`)
+- The webview window is set to `visible: false`; all display is via the tray icon
+- `tray-icon` and `image-png` features must be enabled on the `tauri` crate
+- The `image` crate (0.25, png feature) is used to decode the sprite sheet at startup via `include_bytes!`
