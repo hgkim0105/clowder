@@ -1,5 +1,9 @@
 mod watcher;
 
+#[cfg(target_os = "macos")]
+#[macro_use]
+extern crate objc;
+
 use image::DynamicImage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -52,6 +56,68 @@ pub struct SessionWithState {
     pub tool_name: Option<String>,
     pub state_updated_at: Option<u64>,
     pub stats: Option<SessionStats>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BubbleSess {
+    pub cwd: String,
+    pub model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+pub type SessionMap = Arc<Mutex<HashMap<String, SessionInfo>>>;
+pub type StateMap = Arc<Mutex<HashMap<String, SessionState>>>;
+// (pos_x, pos_y, size_w, size_h) in physical pixels
+pub type TrayRectState = Arc<Mutex<Option<(f64, f64, f64, f64)>>>;
+
+/// Find the session UUID currently active for a given working directory.
+/// Claude Code stores conversations at ~/.claude/projects/<cwd-with-/-as->/><session-id>.jsonl.
+/// The most recently modified JSONL in that directory is the active conversation.
+fn find_active_session_id(cwd: &str) -> Option<String> {
+    let proj_dir_name = cwd.replace('/', "-");
+    let proj_dir = dirs::home_dir()?
+        .join(".claude")
+        .join("projects")
+        .join(&proj_dir_name);
+    if !proj_dir.is_dir() {
+        return None;
+    }
+    let mut latest: Option<(std::time::SystemTime, String)> = None;
+    for entry in fs::read_dir(&proj_dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str())?.to_string();
+        let mtime = entry.metadata().ok()?.modified().ok()?;
+        match &latest {
+            None => latest = Some((mtime, stem)),
+            Some((t, _)) if mtime > *t => latest = Some((mtime, stem)),
+            _ => {}
+        }
+    }
+    latest.map(|(_, id)| id)
+}
+
+/// Look up the best session state: try direct UUID match first, then fall back to the active
+/// conversation for the same project directory. Returns whichever has the more recent timestamp.
+fn find_recent_state<'a>(
+    info: &SessionInfo,
+    states: &'a HashMap<String, SessionState>,
+) -> Option<&'a SessionState> {
+    let direct = states.get(&info.session_id);
+    let active_id = find_active_session_id(&info.cwd);
+    let fallback = active_id.as_deref().and_then(|id| states.get(id));
+    match (direct, fallback) {
+        (Some(d), Some(f)) => {
+            if f.updated_at > d.updated_at { Some(f) } else { Some(d) }
+        }
+        (Some(d), None) => Some(d),
+        (None, Some(f)) => Some(f),
+        (None, None) => None,
+    }
 }
 
 fn find_session_jsonl(session_id: &str) -> Option<PathBuf> {
@@ -126,9 +192,6 @@ pub fn load_session_stats(session_id: &str) -> Option<SessionStats> {
     })
 }
 
-pub type SessionMap = Arc<Mutex<HashMap<String, SessionInfo>>>;
-pub type StateMap = Arc<Mutex<HashMap<String, SessionState>>>;
-
 const FRAME_SIZE: u32 = 32;
 const SPRITE_BYTES: &[u8] = include_bytes!("../../public/Cat Sprite Sheet.png");
 
@@ -183,7 +246,7 @@ pub fn emit_update(
     let mut list: Vec<SessionWithState> = sessions
         .values()
         .map(|info| {
-            let st = states.get(&info.session_id);
+            let st = find_recent_state(info, states);
             SessionWithState {
                 info: info.clone(),
                 state: st.map(|s| s.state.clone()).unwrap_or_else(|| "idle".into()),
@@ -195,6 +258,112 @@ pub fn emit_update(
         .collect();
     list.sort_by_key(|s| s.info.started_at);
     let _ = app.emit("sessions-update", &list);
+}
+
+/// Convert tray event rect position/size to physical pixel coordinates.
+fn phys_coords(
+    pos: tauri::Position,
+    sz: tauri::Size,
+    scale: f64,
+) -> (f64, f64, f64, f64) {
+    let (px, py) = match pos {
+        tauri::Position::Physical(p) => (p.x as f64, p.y as f64),
+        tauri::Position::Logical(p) => (p.x * scale, p.y * scale),
+    };
+    let (sw, sh) = match sz {
+        tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
+        tauri::Size::Logical(s) => (s.width * scale, s.height * scale),
+    };
+    (px, py, sw, sh)
+}
+
+/// Show window without stealing keyboard focus (macOS: orderFront instead of makeKeyAndOrderFront).
+#[cfg(target_os = "macos")]
+fn show_without_focus(win: &tauri::WebviewWindow) {
+    if let Ok(ptr) = win.ns_window() {
+        let ns_window = ptr as *mut objc::runtime::Object;
+        unsafe {
+            let _: () = msg_send![ns_window, orderFront: std::ptr::null::<std::ffi::c_void>()];
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_without_focus(win: &tauri::WebviewWindow) {
+    let _ = win.show();
+}
+
+/// Show the speech bubble when sessions transition to done.
+fn trigger_bubble(
+    app: &AppHandle,
+    tray_rect: &TrayRectState,
+    state_map: &StateMap,
+    session_map: &SessionMap,
+) {
+    // Don't interrupt if the popup is already open
+    if app
+        .get_webview_window("main")
+        .map(|w| w.is_visible().unwrap_or(false))
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    let done_sessions: Vec<BubbleSess> = {
+        let sessions = session_map.lock().unwrap();
+        let states = state_map.lock().unwrap();
+        let mut list: Vec<BubbleSess> = sessions
+            .values()
+            .filter_map(|info| {
+                let st = find_recent_state(info, &*states)?;
+                if st.state != "done" {
+                    return None;
+                }
+                let active_id = find_active_session_id(&info.cwd);
+                let stats = active_id
+                    .as_deref()
+                    .and_then(|id| load_session_stats(id))
+                    .or_else(|| load_session_stats(&info.session_id));
+                Some(BubbleSess {
+                    cwd: info.cwd.clone(),
+                    model: stats.as_ref().and_then(|s| s.model.clone()),
+                    input_tokens: stats.as_ref().map(|s| s.input_tokens).unwrap_or(0),
+                    output_tokens: stats.as_ref().map(|s| s.output_tokens).unwrap_or(0),
+                })
+            })
+            .collect();
+        list.sort_by_key(|s| s.cwd.clone());
+        list
+    };
+
+    if done_sessions.is_empty() {
+        return;
+    }
+
+    let stored_rect = *tray_rect.lock().unwrap();
+    let app_clone = app.clone();
+
+    let _ = app.run_on_main_thread(move || {
+        let Some(bubble) = app_clone.get_webview_window("bubble") else {
+            return;
+        };
+
+        // Resize: 1 session → 80px, 2+ → 116px
+        let height = if done_sessions.len() > 1 { 116.0_f64 } else { 80.0_f64 };
+        let _ = bubble.set_size(tauri::LogicalSize::new(260.0_f64, height));
+
+        // Position bubble centered below the tray icon
+        if let Some((px, py, sw, sh)) = stored_rect {
+            let scale = bubble.scale_factor().unwrap_or(2.0);
+            let bubble_w_phys = 260.0 * scale;
+            let x = (px + sw / 2.0 - bubble_w_phys / 2.0).max(0.0);
+            let y = py + sh;
+            let _ = bubble.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
+        }
+
+        let _ = app_clone.emit("show-bubble", &done_sessions);
+        show_without_focus(&bubble);
+    });
 }
 
 /// (row, frame_count, fps)
@@ -214,15 +383,6 @@ fn anim_config(state: &str, active_count: usize) -> (u32, u32, u64) {
     }
 }
 
-fn compute_display_state(list: &[SessionWithState]) -> (&'static str, usize) {
-    let working = list.iter().filter(|s| s.state != "idle" && s.state != "done").count();
-    if working > 0 {
-        return ("working", working);
-    }
-    let done = list.iter().any(|s| s.state == "done");
-    if done { ("done", 0) } else { ("idle", 0) }
-}
-
 fn make_icon(sheet: &DynamicImage, row: u32, col: u32) -> TauriImage<'static> {
     use image::imageops::FilterType;
 
@@ -230,7 +390,6 @@ fn make_icon(sheet: &DynamicImage, row: u32, col: u32) -> TauriImage<'static> {
     let rgba = sub.to_rgba8();
     let (w, h) = rgba.dimensions();
 
-    // Find tight bounding box of visible (non-transparent) pixels
     const ALPHA_THRESH: u8 = 10;
     let min_x = (0..w).find(|&x| (0..h).any(|y| rgba.get_pixel(x, y)[3] > ALPHA_THRESH)).unwrap_or(0);
     let max_x = (0..w).rev().find(|&x| (0..h).any(|y| rgba.get_pixel(x, y)[3] > ALPHA_THRESH)).map(|x| x + 1).unwrap_or(w);
@@ -240,7 +399,6 @@ fn make_icon(sheet: &DynamicImage, row: u32, col: u32) -> TauriImage<'static> {
     let crop_w = max_x.saturating_sub(min_x).max(1);
     let crop_h = max_y.saturating_sub(min_y).max(1);
 
-    // Crop to cat only, then scale to 64x64 for sharp retina rendering
     let cropped = sub.crop_imm(min_x, min_y, crop_w, crop_h);
     let scaled = cropped.resize_exact(64, 64, FilterType::Nearest);
     let out = scaled.to_rgba8();
@@ -249,23 +407,36 @@ fn make_icon(sheet: &DynamicImage, row: u32, col: u32) -> TauriImage<'static> {
 }
 
 async fn animation_loop(
+    app: AppHandle,
     tray: tauri::tray::TrayIcon,
-    session_map: SessionMap,
     state_map: StateMap,
+    session_map: SessionMap,
+    tray_rect: TrayRectState,
     sheet: Arc<DynamicImage>,
 ) {
     const DONE_DISPLAY_SECS: u64 = 4;
 
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut display_state = String::from("idle");
-    let mut active_count: usize = 0;
     let mut current_frame: u32 = 0;
     let mut last_frame_time = Instant::now();
     let mut done_since: Option<Instant> = None;
 
+    // Initialise prev_raw_display to current state so startup doesn't fire bubble
+    let mut prev_raw_display = {
+        let states = state_map.lock().unwrap();
+        let working = states.values().filter(|s| s.state != "idle" && s.state != "done").count();
+        if working > 0 {
+            "working".to_string()
+        } else if states.values().any(|s| s.state == "done") {
+            "done".to_string()
+        } else {
+            "idle".to_string()
+        }
+    };
+
     eprintln!("[clowder] animation_loop started");
 
-    // Initial render
     let (row, _, _) = anim_config("idle", 0);
     let result = tray.set_icon(Some(make_icon(&sheet, row, 0)));
     eprintln!("[clowder] initial set_icon result: {:?}", result);
@@ -274,24 +445,22 @@ async fn animation_loop(
         tick.tick().await;
 
         let (raw_display, new_active) = {
-            let sessions = session_map.lock().unwrap();
             let states = state_map.lock().unwrap();
-            let list: Vec<SessionWithState> = sessions
-                .values()
-                .map(|info| {
-                    let st = states.get(&info.session_id);
-                    SessionWithState {
-                        info: info.clone(),
-                        state: st.map(|s| s.state.clone()).unwrap_or_else(|| "idle".into()),
-                        tool_name: st.and_then(|s| s.tool_name.clone()),
-                        state_updated_at: None,
-                        stats: None,
-                    }
-                })
-                .collect();
-            let (s, c) = compute_display_state(&list);
-            (s.to_string(), c)
+            let working = states.values().filter(|s| s.state != "idle" && s.state != "done").count();
+            if working > 0 {
+                ("working".to_string(), working)
+            } else if states.values().any(|s| s.state == "done") {
+                ("done".to_string(), 0)
+            } else {
+                ("idle".to_string(), 0)
+            }
         };
+
+        // Detect idle/working → done transition and show bubble
+        if raw_display == "done" && prev_raw_display != "done" {
+            trigger_bubble(&app, &tray_rect, &state_map, &session_map);
+        }
+        prev_raw_display = raw_display.clone();
 
         // "done" shows for DONE_DISPLAY_SECS then reverts to idle
         let effective_display: &str = if raw_display == "done" {
@@ -312,11 +481,9 @@ async fn animation_loop(
 
         if effective_display != display_state {
             display_state = effective_display.to_string();
-            active_count = new_active;
             current_frame = 0;
             last_frame_time = Instant::now();
         } else {
-            active_count = new_active;
             let frame_dur = Duration::from_millis(1000 / fps);
             if last_frame_time.elapsed() >= frame_dur {
                 current_frame = (current_frame + 1) % frame_count;
@@ -345,13 +512,19 @@ fn get_sessions(
     let mut list: Vec<SessionWithState> = sessions
         .values()
         .map(|info| {
-            let st = states.get(&info.session_id);
+            let st = find_recent_state(info, &*states);
+            // Load stats from the active conversation JSONL first, fall back to the session UUID
+            let active_id = find_active_session_id(&info.cwd);
+            let stats = active_id
+                .as_deref()
+                .and_then(|id| load_session_stats(id))
+                .or_else(|| load_session_stats(&info.session_id));
             SessionWithState {
                 info: info.clone(),
                 state: st.map(|s| s.state.clone()).unwrap_or_else(|| "idle".into()),
                 tool_name: st.and_then(|s| s.tool_name.clone()),
                 state_updated_at: st.map(|s| s.updated_at),
-                stats: load_session_stats(&info.session_id),
+                stats,
             }
         })
         .collect();
@@ -363,6 +536,7 @@ fn get_sessions(
 pub fn run() {
     let session_map: SessionMap = Arc::new(Mutex::new(load_sessions()));
     let state_map: StateMap = Arc::new(Mutex::new(HashMap::new()));
+    let tray_rect_state: TrayRectState = Arc::new(Mutex::new(None));
 
     // Pre-load existing state files
     {
@@ -375,7 +549,6 @@ pub fn run() {
         }
     }
 
-    // Load sprite sheet once at startup
     let sheet = Arc::new(
         image::load_from_memory(SPRITE_BYTES).expect("failed to load sprite sheet"),
     );
@@ -387,16 +560,16 @@ pub fn run() {
         .setup(move |app| {
             let _ = fs::create_dir_all(state_dir());
 
-            // No Dock icon, no app switcher entry
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            // Hide the webview window
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.hide();
             }
+            if let Some(win) = app.get_webview_window("bubble") {
+                let _ = win.hide();
+            }
 
-            // Tray menu
             let quit_item = tauri::menu::MenuItem::with_id(
                 app,
                 "quit",
@@ -406,10 +579,10 @@ pub fn run() {
             )?;
             let menu = tauri::menu::Menu::with_items(app, &[&quit_item])?;
 
-            // Initial idle frame
             let (row, _, _) = anim_config("idle", 0);
             let initial_icon = make_icon(&sheet, row, 0);
 
+            let tray_rect_for_handler = tray_rect_state.clone();
             let tray = TrayIconBuilder::new()
                 .icon(initial_icon)
                 .tooltip("clowder")
@@ -420,43 +593,66 @@ pub fn run() {
                         app.exit(0);
                     }
                 })
-                .on_tray_icon_event(|tray, event| {
-                    use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        rect,
-                        ..
-                    } = event {
+                .on_tray_icon_event({
+                    let tray_rect_clone = tray_rect_for_handler;
+                    move |tray, event| {
+                        use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+
                         let app = tray.app_handle();
-                        if let Some(win) = app.get_webview_window("main") {
-                            if win.is_visible().unwrap_or(false) {
-                                let _ = win.hide();
-                            } else {
-                                let scale = win.scale_factor().unwrap_or(2.0);
-                                let (pos_x, pos_y) = match rect.position {
-                                    tauri::Position::Physical(p) => (p.x as f64, p.y as f64),
-                                    tauri::Position::Logical(p) => (p.x * scale, p.y * scale),
-                                };
-                                let (sz_w, sz_h) = match rect.size {
-                                    tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
-                                    tauri::Size::Logical(s) => (s.width * scale, s.height * scale),
-                                };
-                                let win_width_phys = 320.0 * scale;
-                                let x = (pos_x + sz_w / 2.0 - win_width_phys / 2.0).max(0.0);
-                                let y = pos_y + sz_h;
-                                let _ = win.set_position(tauri::PhysicalPosition::new(
-                                    x as i32, y as i32,
-                                ));
-                                let _ = win.show();
-                                let _ = win.set_focus();
+                        let scale = app
+                            .get_webview_window("main")
+                            .and_then(|w| w.scale_factor().ok())
+                            .unwrap_or(2.0);
+
+                        // Keep the stored tray rect up-to-date from any event
+                        {
+                            let (px, py, sw, sh) = match &event {
+                                TrayIconEvent::Click { rect, .. }
+                                | TrayIconEvent::Move { rect, .. }
+                                | TrayIconEvent::Enter { rect, .. } => {
+                                    phys_coords(rect.position, rect.size, scale)
+                                }
+                                _ => (0.0, 0.0, 0.0, 0.0),
+                            };
+                            if sw > 0.0 {
+                                *tray_rect_clone.lock().unwrap() = Some((px, py, sw, sh));
+                            }
+                        }
+
+                        // Toggle popup on left click
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            rect,
+                            ..
+                        } = event
+                        {
+                            if let Some(win) = app.get_webview_window("main") {
+                                if win.is_visible().unwrap_or(false) {
+                                    let _ = win.hide();
+                                } else {
+                                    // Hide bubble if it's showing
+                                    if let Some(b) = app.get_webview_window("bubble") {
+                                        let _ = b.hide();
+                                    }
+                                    let (pos_x, pos_y, sz_w, sz_h) =
+                                        phys_coords(rect.position, rect.size, scale);
+                                    let win_width_phys = 320.0 * scale;
+                                    let x = (pos_x + sz_w / 2.0 - win_width_phys / 2.0).max(0.0);
+                                    let y = pos_y + sz_h;
+                                    let _ = win.set_position(tauri::PhysicalPosition::new(
+                                        x as i32, y as i32,
+                                    ));
+                                    let _ = win.show();
+                                    let _ = win.set_focus();
+                                }
                             }
                         }
                     }
                 })
                 .build(app)?;
 
-            // Hide popup when it loses focus
+            // Hide popup on focus loss
             if let Some(win) = app.get_webview_window("main") {
                 let win_clone = win.clone();
                 win.on_window_event(move |event| {
@@ -466,16 +662,16 @@ pub fn run() {
                 });
             }
 
-            // Start file watchers
             let app_handle = app.handle().clone();
             start_watchers(app_handle, session_map.clone(), state_map.clone());
 
-            // Spawn animation loop — tray moved in, kept alive by the task
-            let sm = session_map.clone();
+            let app_for_anim = app.handle().clone();
             let stm = state_map.clone();
+            let sess = session_map.clone();
+            let tr = tray_rect_state.clone();
             let sheet_clone = sheet.clone();
             tauri::async_runtime::spawn(async move {
-                animation_loop(tray, sm, stm, sheet_clone).await;
+                animation_loop(app_for_anim, tray, stm, sess, tr, sheet_clone).await;
             });
 
             Ok(())

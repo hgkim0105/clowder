@@ -22,6 +22,19 @@
         "skipTaskbar": true,
         "visible": false,
         "shadow": true
+      },
+      {
+        "label": "bubble",
+        "title": "clowder-bubble",
+        "width": 260,
+        "height": 80,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "shadow": false
       }
     ],
     "security": {
