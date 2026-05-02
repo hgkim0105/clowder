@@ -7,18 +7,22 @@ export function useSessions() {
   const [sessions, setSessions] = useState<SessionWithState[]>([]);
 
   useEffect(() => {
-    // Initial load
-    invoke<SessionWithState[]>("get_sessions")
-      .then(setSessions)
-      .catch(console.error);
+    const refresh = () =>
+      invoke<SessionWithState[]>("get_sessions")
+        .then(setSessions)
+        .catch(console.error);
 
-    // Live updates via events
-    const unlisten = listen<SessionWithState[]>("sessions-update", (event) => {
-      setSessions(event.payload);
-    });
+    refresh();
+
+    // Re-fetch (with stats) on any state change
+    const unlisten = listen("sessions-update", refresh);
+
+    // Periodic refresh every 10s for token updates
+    const timer = setInterval(refresh, 10_000);
 
     return () => {
       unlisten.then((fn) => fn());
+      clearInterval(timer);
     };
   }, []);
 

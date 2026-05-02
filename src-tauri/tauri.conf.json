@@ -13,18 +13,15 @@
     "windows": [
       {
         "title": "clowder",
-        "width": 800,
-        "height": 120,
-        "minWidth": 200,
-        "minHeight": 80,
-        "resizable": true,
+        "width": 320,
+        "height": 480,
+        "resizable": false,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "visible": false,
-        "x": 0,
-        "y": 0
+        "shadow": true
       }
     ],
     "security": {

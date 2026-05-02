@@ -4,6 +4,7 @@ use image::DynamicImage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,7 +12,6 @@ use tauri::image::Image as TauriImage;
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager};
 use watcher::start_watchers;
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -33,11 +33,97 @@ pub struct SessionState {
     pub updated_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStats {
+    pub model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub context_window: u64,
+    pub speed: Option<String>,
+    pub permission_mode: Option<String>,
+    pub has_thinking: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionWithState {
     pub info: SessionInfo,
     pub state: String,
     pub tool_name: Option<String>,
+    pub state_updated_at: Option<u64>,
+    pub stats: Option<SessionStats>,
+}
+
+fn find_session_jsonl(session_id: &str) -> Option<PathBuf> {
+    let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
+    let filename = format!("{}.jsonl", session_id);
+    for entry in fs::read_dir(&projects_dir).ok()?.flatten() {
+        let candidate = entry.path().join(&filename);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+pub fn load_session_stats(session_id: &str) -> Option<SessionStats> {
+    let path = find_session_jsonl(session_id)?;
+    let mut file = fs::File::open(&path).ok()?;
+    let size = file.seek(SeekFrom::End(0)).ok()?;
+    file.seek(SeekFrom::Start(size.saturating_sub(65536))).ok()?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+
+    let mut model = None;
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut speed = None;
+    let mut permission_mode = None;
+    let mut has_thinking = false;
+    let mut found_model = false;
+    let mut found_perm = false;
+
+    for line in buf.lines().rev() {
+        if found_model && found_perm {
+            break;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+
+        if !found_perm {
+            if let Some(pm) = v["permissionMode"].as_str() {
+                permission_mode = Some(pm.to_string());
+                found_perm = true;
+            }
+        }
+
+        if !found_model && v["type"].as_str() == Some("assistant") {
+            if let Some(usage) = v["message"]["usage"].as_object() {
+                model = v["message"]["model"].as_str().map(|s| s.to_string());
+                let inp = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let cr = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let cc = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                input_tokens = inp + cr + cc;
+                output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                speed = usage.get("speed").and_then(|v| v.as_str()).map(|s| s.to_string());
+                if let Some(content) = v["message"]["content"].as_array() {
+                    has_thinking = content.iter().any(|c| c["type"].as_str() == Some("thinking"));
+                }
+                found_model = true;
+            }
+        }
+    }
+
+    Some(SessionStats {
+        model,
+        input_tokens,
+        output_tokens,
+        context_window: 200_000,
+        speed,
+        permission_mode,
+        has_thinking,
+    })
 }
 
 pub type SessionMap = Arc<Mutex<HashMap<String, SessionInfo>>>;
@@ -102,6 +188,8 @@ pub fn emit_update(
                 info: info.clone(),
                 state: st.map(|s| s.state.clone()).unwrap_or_else(|| "idle".into()),
                 tool_name: st.and_then(|s| s.tool_name.clone()),
+                state_updated_at: st.map(|s| s.updated_at),
+                stats: None,
             }
         })
         .collect();
@@ -113,6 +201,7 @@ pub fn emit_update(
 fn anim_config(state: &str, active_count: usize) -> (u32, u32, u64) {
     match state {
         "idle"    => (0, 4, 6),
+        "done"    => (6, 4, 8),
         "working" => {
             let fps = match active_count {
                 0 | 1 => 12,
@@ -126,13 +215,16 @@ fn anim_config(state: &str, active_count: usize) -> (u32, u32, u64) {
 }
 
 fn compute_display_state(list: &[SessionWithState]) -> (&'static str, usize) {
-    let active = list.iter().filter(|s| s.state != "idle").count();
-    if active > 0 { ("working", active) } else { ("idle", 0) }
+    let working = list.iter().filter(|s| s.state != "idle" && s.state != "done").count();
+    if working > 0 {
+        return ("working", working);
+    }
+    let done = list.iter().any(|s| s.state == "done");
+    if done { ("done", 0) } else { ("idle", 0) }
 }
 
 fn make_icon(sheet: &DynamicImage, row: u32, col: u32) -> TauriImage<'static> {
     use image::imageops::FilterType;
-    use image::{GenericImageView, Rgba};
 
     let sub = sheet.crop_imm(col * FRAME_SIZE, row * FRAME_SIZE, FRAME_SIZE, FRAME_SIZE);
     let rgba = sub.to_rgba8();
@@ -162,11 +254,14 @@ async fn animation_loop(
     state_map: StateMap,
     sheet: Arc<DynamicImage>,
 ) {
+    const DONE_DISPLAY_SECS: u64 = 4;
+
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut display_state = String::from("idle");
     let mut active_count: usize = 0;
     let mut current_frame: u32 = 0;
     let mut last_frame_time = Instant::now();
+    let mut done_since: Option<Instant> = None;
 
     eprintln!("[clowder] animation_loop started");
 
@@ -178,7 +273,7 @@ async fn animation_loop(
     loop {
         tick.tick().await;
 
-        let (new_display, new_active) = {
+        let (raw_display, new_active) = {
             let sessions = session_map.lock().unwrap();
             let states = state_map.lock().unwrap();
             let list: Vec<SessionWithState> = sessions
@@ -189,6 +284,8 @@ async fn animation_loop(
                         info: info.clone(),
                         state: st.map(|s| s.state.clone()).unwrap_or_else(|| "idle".into()),
                         tool_name: st.and_then(|s| s.tool_name.clone()),
+                        state_updated_at: None,
+                        stats: None,
                     }
                 })
                 .collect();
@@ -196,10 +293,25 @@ async fn animation_loop(
             (s.to_string(), c)
         };
 
-        let (row, frame_count, fps) = anim_config(&new_display, new_active);
+        // "done" shows for DONE_DISPLAY_SECS then reverts to idle
+        let effective_display: &str = if raw_display == "done" {
+            if done_since.is_none() {
+                done_since = Some(Instant::now());
+            }
+            if done_since.unwrap().elapsed().as_secs() < DONE_DISPLAY_SECS {
+                "done"
+            } else {
+                "idle"
+            }
+        } else {
+            done_since = None;
+            &raw_display
+        };
 
-        if new_display != display_state {
-            display_state = new_display;
+        let (row, frame_count, fps) = anim_config(effective_display, new_active);
+
+        if effective_display != display_state {
+            display_state = effective_display.to_string();
             active_count = new_active;
             current_frame = 0;
             last_frame_time = Instant::now();
@@ -219,6 +331,11 @@ async fn animation_loop(
 }
 
 #[tauri::command]
+fn quit_app(app: AppHandle) {
+    app.exit(0);
+}
+
+#[tauri::command]
 fn get_sessions(
     sessions: tauri::State<SessionMap>,
     states: tauri::State<StateMap>,
@@ -233,6 +350,8 @@ fn get_sessions(
                 info: info.clone(),
                 state: st.map(|s| s.state.clone()).unwrap_or_else(|| "idle".into()),
                 tool_name: st.and_then(|s| s.tool_name.clone()),
+                state_updated_at: st.map(|s| s.updated_at),
+                stats: load_session_stats(&info.session_id),
             }
         })
         .collect();
@@ -264,7 +383,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(session_map.clone())
         .manage(state_map.clone())
-        .invoke_handler(tauri::generate_handler![get_sessions])
+        .invoke_handler(tauri::generate_handler![get_sessions, quit_app])
         .setup(move |app| {
             let _ = fs::create_dir_all(state_dir());
 
@@ -295,12 +414,57 @@ pub fn run() {
                 .icon(initial_icon)
                 .tooltip("clowder")
                 .menu(&menu)
+                .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| {
                     if event.id().as_ref() == "quit" {
                         app.exit(0);
                     }
                 })
+                .on_tray_icon_event(|tray, event| {
+                    use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        rect,
+                        ..
+                    } = event {
+                        let app = tray.app_handle();
+                        if let Some(win) = app.get_webview_window("main") {
+                            if win.is_visible().unwrap_or(false) {
+                                let _ = win.hide();
+                            } else {
+                                let scale = win.scale_factor().unwrap_or(2.0);
+                                let (pos_x, pos_y) = match rect.position {
+                                    tauri::Position::Physical(p) => (p.x as f64, p.y as f64),
+                                    tauri::Position::Logical(p) => (p.x * scale, p.y * scale),
+                                };
+                                let (sz_w, sz_h) = match rect.size {
+                                    tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
+                                    tauri::Size::Logical(s) => (s.width * scale, s.height * scale),
+                                };
+                                let win_width_phys = 320.0 * scale;
+                                let x = (pos_x + sz_w / 2.0 - win_width_phys / 2.0).max(0.0);
+                                let y = pos_y + sz_h;
+                                let _ = win.set_position(tauri::PhysicalPosition::new(
+                                    x as i32, y as i32,
+                                ));
+                                let _ = win.show();
+                                let _ = win.set_focus();
+                            }
+                        }
+                    }
+                })
                 .build(app)?;
+
+            // Hide popup when it loses focus
+            if let Some(win) = app.get_webview_window("main") {
+                let win_clone = win.clone();
+                win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::Focused(false) = event {
+                        let _ = win_clone.hide();
+                    }
+                });
+            }
 
             // Start file watchers
             let app_handle = app.handle().clone();

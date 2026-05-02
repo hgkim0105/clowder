@@ -9,10 +9,22 @@ export interface SessionInfo {
   entrypoint?: string;
 }
 
+export interface SessionStats {
+  model: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  contextWindow: number;
+  speed: string | null;
+  permissionMode: string | null;
+  hasThinking: boolean;
+}
+
 export interface SessionWithState {
   info: SessionInfo;
   state: CatState;
   toolName?: string;
+  stateUpdatedAt?: number | null;
+  stats?: SessionStats | null;
 }
 
 export interface AnimConfig {
