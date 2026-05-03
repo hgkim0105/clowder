@@ -106,8 +106,19 @@ fn find_active_session_id(cwd: &str) -> Option<String> {
 fn find_recent_state<'a>(
     info: &SessionInfo,
     states: &'a HashMap<String, SessionState>,
+    sessions: &HashMap<String, SessionInfo>,
 ) -> Option<&'a SessionState> {
     let direct = states.get(&info.session_id);
+
+    // Only use the JSONL fallback when this session is the sole occupant of its CWD.
+    // Multiple sessions in the same directory share the same project folder, so
+    // find_active_session_id would return the same UUID for all of them and cause
+    // one session's state to bleed into the others.
+    let sole_in_cwd = sessions.values().filter(|s| s.cwd == info.cwd).count() == 1;
+    if !sole_in_cwd {
+        return direct;
+    }
+
     let active_id = find_active_session_id(&info.cwd);
     let fallback = active_id.as_deref().and_then(|id| states.get(id));
     match (direct, fallback) {
@@ -181,15 +192,36 @@ pub fn load_session_stats(session_id: &str) -> Option<SessionStats> {
         }
     }
 
+    let context_window = context_window_for_model(model.as_deref(), input_tokens);
+
     Some(SessionStats {
         model,
         input_tokens,
         output_tokens,
-        context_window: 200_000,
+        context_window,
         speed,
         permission_mode,
         has_thinking,
     })
+}
+
+/// Pick the context window based on model id. Newer Claude 4.x models support 1M
+/// context; everything else defaults to 200k. If the observed input already exceeds
+/// the picked value, fall back to 1M so the bar stays meaningful.
+fn context_window_for_model(model: Option<&str>, observed: u64) -> u64 {
+    let base = match model {
+        Some(m) => {
+            let m = m.to_ascii_lowercase();
+            // Claude 4.x families that support 1M context
+            if m.contains("opus-4") || m.contains("sonnet-4") || m.contains("haiku-4") {
+                1_000_000
+            } else {
+                200_000
+            }
+        }
+        None => 200_000,
+    };
+    if observed > base { 1_000_000 } else { base }
 }
 
 const FRAME_SIZE: u32 = 32;
@@ -238,6 +270,30 @@ fn load_state(session_id: &str) -> Option<SessionState> {
     serde_json::from_str(&content).ok()
 }
 
+/// "done" only stays fresh briefly. After this many seconds since the last state
+/// update, treat done as idle for display purposes — the user has long since
+/// moved on and persistent green dots are noise.
+const DONE_FRESHNESS_SECS: u64 = 60;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Display-time view of state: stale "done" decays to "idle".
+fn effective_state(st: Option<&SessionState>) -> (String, Option<String>, Option<u64>) {
+    let Some(s) = st else {
+        return ("idle".into(), None, None);
+    };
+    if s.state == "done" && now_ms().saturating_sub(s.updated_at) > DONE_FRESHNESS_SECS * 1000 {
+        ("idle".into(), None, Some(s.updated_at))
+    } else {
+        (s.state.clone(), s.tool_name.clone(), Some(s.updated_at))
+    }
+}
+
 pub fn emit_update(
     app: &AppHandle,
     sessions: &HashMap<String, SessionInfo>,
@@ -246,12 +302,13 @@ pub fn emit_update(
     let mut list: Vec<SessionWithState> = sessions
         .values()
         .map(|info| {
-            let st = find_recent_state(info, states);
+            let st = find_recent_state(info, states, sessions);
+            let (state, tool_name, state_updated_at) = effective_state(st);
             SessionWithState {
                 info: info.clone(),
-                state: st.map(|s| s.state.clone()).unwrap_or_else(|| "idle".into()),
-                tool_name: st.and_then(|s| s.tool_name.clone()),
-                state_updated_at: st.map(|s| s.updated_at),
+                state,
+                tool_name,
+                state_updated_at,
                 stats: None,
             }
         })
@@ -277,14 +334,19 @@ fn phys_coords(
     (px, py, sw, sh)
 }
 
-/// Show window without stealing keyboard focus (macOS: orderFront instead of makeKeyAndOrderFront).
+/// Show window without stealing keyboard focus.
+/// orderFrontRegardless works even when the app is in Accessory (background) mode.
+/// NSStatusBarWindowLevel (25) places the bubble above the menu bar, ensuring visibility.
 #[cfg(target_os = "macos")]
 fn show_without_focus(win: &tauri::WebviewWindow) {
     if let Ok(ptr) = win.ns_window() {
         let ns_window = ptr as *mut objc::runtime::Object;
         unsafe {
-            let _: () = msg_send![ns_window, orderFront: std::ptr::null::<std::ffi::c_void>()];
+            let _: () = msg_send![ns_window, setLevel: 25i64];
+            let _: () = msg_send![ns_window, orderFrontRegardless];
         }
+    } else {
+        let _ = win.show();
     }
 }
 
@@ -296,6 +358,7 @@ fn show_without_focus(win: &tauri::WebviewWindow) {
 /// Show the speech bubble when sessions transition to done.
 fn trigger_bubble(
     app: &AppHandle,
+    tray: &tauri::tray::TrayIcon,
     tray_rect: &TrayRectState,
     state_map: &StateMap,
     session_map: &SessionMap,
@@ -312,27 +375,44 @@ fn trigger_bubble(
     let done_sessions: Vec<BubbleSess> = {
         let sessions = session_map.lock().unwrap();
         let states = state_map.lock().unwrap();
-        let mut list: Vec<BubbleSess> = sessions
-            .values()
-            .filter_map(|info| {
-                let st = find_recent_state(info, &*states)?;
-                if st.state != "done" {
-                    return None;
-                }
-                let active_id = find_active_session_id(&info.cwd);
-                let stats = active_id
-                    .as_deref()
-                    .and_then(|id| load_session_stats(id))
-                    .or_else(|| load_session_stats(&info.session_id));
-                Some(BubbleSess {
+        let sole_in_cwd_for = |cwd: &str| sessions.values().filter(|s| s.cwd == cwd).count() == 1;
+        // Pick the most recently updated done session per cwd, fresh ones only
+        let now = now_ms();
+        let mut by_cwd: HashMap<String, (&SessionInfo, u64)> = HashMap::new();
+        for info in sessions.values() {
+            let Some(st) = find_recent_state(info, &*states, &*sessions) else { continue };
+            if st.state != "done" { continue; }
+            if now.saturating_sub(st.updated_at) > DONE_FRESHNESS_SECS * 1000 { continue; }
+            by_cwd
+                .entry(info.cwd.clone())
+                .and_modify(|(cur, ts)| {
+                    if st.updated_at > *ts {
+                        *cur = info;
+                        *ts = st.updated_at;
+                    }
+                })
+                .or_insert((info, st.updated_at));
+        }
+        let mut list: Vec<BubbleSess> = by_cwd
+            .into_values()
+            .map(|(info, _)| {
+                let stats = if sole_in_cwd_for(&info.cwd) {
+                    find_active_session_id(&info.cwd)
+                        .as_deref()
+                        .and_then(load_session_stats)
+                        .or_else(|| load_session_stats(&info.session_id))
+                } else {
+                    load_session_stats(&info.session_id)
+                };
+                BubbleSess {
                     cwd: info.cwd.clone(),
                     model: stats.as_ref().and_then(|s| s.model.clone()),
                     input_tokens: stats.as_ref().map(|s| s.input_tokens).unwrap_or(0),
                     output_tokens: stats.as_ref().map(|s| s.output_tokens).unwrap_or(0),
-                })
+                }
             })
             .collect();
-        list.sort_by_key(|s| s.cwd.clone());
+        list.sort_by(|a, b| a.cwd.cmp(&b.cwd));
         list
     };
 
@@ -340,7 +420,15 @@ fn trigger_bubble(
         return;
     }
 
-    let stored_rect = *tray_rect.lock().unwrap();
+    // Prefer cached rect; fall back to live tray.rect() query
+    let stored_rect: Option<(f64, f64, f64, f64)> = tray_rect.lock().unwrap().or_else(|| {
+        let r = tray.rect().ok()??;
+        let scale = app
+            .get_webview_window("main")
+            .and_then(|w| w.scale_factor().ok())
+            .unwrap_or(2.0);
+        Some(phys_coords(r.position, r.size, scale))
+    });
     let app_clone = app.clone();
 
     let _ = app.run_on_main_thread(move || {
@@ -348,21 +436,19 @@ fn trigger_bubble(
             return;
         };
 
-        // Resize: 1 session → 80px, 2+ → 116px
         let height = if done_sessions.len() > 1 { 116.0_f64 } else { 80.0_f64 };
         let _ = bubble.set_size(tauri::LogicalSize::new(260.0_f64, height));
 
-        // Position bubble centered below the tray icon
         if let Some((px, py, sw, sh)) = stored_rect {
             let scale = bubble.scale_factor().unwrap_or(2.0);
             let bubble_w_phys = 260.0 * scale;
             let x = (px + sw / 2.0 - bubble_w_phys / 2.0).max(0.0);
-            let y = py + sh;
+            let y = py + sh + 8.0 * scale;
             let _ = bubble.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
         }
 
-        let _ = app_clone.emit("show-bubble", &done_sessions);
         show_without_focus(&bubble);
+        let _ = app_clone.emit("show-bubble", &done_sessions);
     });
 }
 
@@ -422,17 +508,28 @@ async fn animation_loop(
     let mut last_frame_time = Instant::now();
     let mut done_since: Option<Instant> = None;
 
+    // Stale "done" states (from sessions that finished long ago and are now sitting
+    // idle waiting for user input) shouldn't keep the cat in done forever, nor cause
+    // false bubble triggers. Match the popup's freshness window.
+    let raw_display_from = |states: &HashMap<String, SessionState>| -> (String, usize) {
+        let now = now_ms();
+        let working = states.values().filter(|s| s.state != "idle" && s.state != "done").count();
+        if working > 0 {
+            ("working".to_string(), working)
+        } else if states
+            .values()
+            .any(|s| s.state == "done" && now.saturating_sub(s.updated_at) <= DONE_FRESHNESS_SECS * 1000)
+        {
+            ("done".to_string(), 0)
+        } else {
+            ("idle".to_string(), 0)
+        }
+    };
+
     // Initialise prev_raw_display to current state so startup doesn't fire bubble
     let mut prev_raw_display = {
         let states = state_map.lock().unwrap();
-        let working = states.values().filter(|s| s.state != "idle" && s.state != "done").count();
-        if working > 0 {
-            "working".to_string()
-        } else if states.values().any(|s| s.state == "done") {
-            "done".to_string()
-        } else {
-            "idle".to_string()
-        }
+        raw_display_from(&*states).0
     };
 
     eprintln!("[clowder] animation_loop started");
@@ -446,19 +543,12 @@ async fn animation_loop(
 
         let (raw_display, new_active) = {
             let states = state_map.lock().unwrap();
-            let working = states.values().filter(|s| s.state != "idle" && s.state != "done").count();
-            if working > 0 {
-                ("working".to_string(), working)
-            } else if states.values().any(|s| s.state == "done") {
-                ("done".to_string(), 0)
-            } else {
-                ("idle".to_string(), 0)
-            }
+            raw_display_from(&*states)
         };
 
         // Detect idle/working → done transition and show bubble
         if raw_display == "done" && prev_raw_display != "done" {
-            trigger_bubble(&app, &tray_rect, &state_map, &session_map);
+            trigger_bubble(&app, &tray, &tray_rect, &state_map, &session_map);
         }
         prev_raw_display = raw_display.clone();
 
@@ -512,18 +602,24 @@ fn get_sessions(
     let mut list: Vec<SessionWithState> = sessions
         .values()
         .map(|info| {
-            let st = find_recent_state(info, &*states);
-            // Load stats from the active conversation JSONL first, fall back to the session UUID
-            let active_id = find_active_session_id(&info.cwd);
-            let stats = active_id
-                .as_deref()
-                .and_then(|id| load_session_stats(id))
-                .or_else(|| load_session_stats(&info.session_id));
+            let st = find_recent_state(info, &*states, &*sessions);
+            let sole_in_cwd = sessions.values().filter(|s| s.cwd == info.cwd).count() == 1;
+            let stats = if sole_in_cwd {
+                // Single session in this CWD: prefer the most recently active JSONL
+                find_active_session_id(&info.cwd)
+                    .as_deref()
+                    .and_then(load_session_stats)
+                    .or_else(|| load_session_stats(&info.session_id))
+            } else {
+                // Multiple sessions in same CWD: only use the session's own UUID
+                load_session_stats(&info.session_id)
+            };
+            let (state, tool_name, state_updated_at) = effective_state(st);
             SessionWithState {
                 info: info.clone(),
-                state: st.map(|s| s.state.clone()).unwrap_or_else(|| "idle".into()),
-                tool_name: st.and_then(|s| s.tool_name.clone()),
-                state_updated_at: st.map(|s| s.updated_at),
+                state,
+                tool_name,
+                state_updated_at,
                 stats,
             }
         })
@@ -556,6 +652,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(session_map.clone())
         .manage(state_map.clone())
+        .manage(tray_rect_state.clone())
         .invoke_handler(tauri::generate_handler![get_sessions, quit_app])
         .setup(move |app| {
             let _ = fs::create_dir_all(state_dir());
