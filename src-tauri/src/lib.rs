@@ -660,6 +660,36 @@ fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
+#[cfg(target_os = "macos")]
+fn show_about_dialog() {
+    use objc::runtime::Object;
+    unsafe {
+        let cls = objc::runtime::Class::get("NSAlert").unwrap();
+        let alert: *mut Object = msg_send![cls, new];
+        let title = cocoa_string("Clowder 0.1.3");
+        let msg = cocoa_string(
+            "Claude Code cat companion\n\nWatches your Claude Code sessions\nand brings them to life in the menu bar.\n\nBuilt with Tauri + Rust + React\nby a non-Rust developer + Claude 🐱",
+        );
+        let _: () = msg_send![alert, setMessageText: title];
+        let _: () = msg_send![alert, setInformativeText: msg];
+        let _: () = msg_send![alert, runModal];
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cocoa_string(s: &str) -> *mut objc::runtime::Object {
+    use objc::runtime::Object;
+    unsafe {
+        let cls = objc::runtime::Class::get("NSString").unwrap();
+        let bytes = s.as_ptr() as *const std::os::raw::c_void;
+        let ns_str: *mut Object =
+            msg_send![cls, alloc];
+        let ns_str: *mut Object =
+            msg_send![ns_str, initWithBytes:bytes length:s.len() encoding:4u64];
+        ns_str
+    }
+}
+
 #[tauri::command]
 fn get_sessions(
     sessions: tauri::State<SessionMap>,
@@ -760,14 +790,22 @@ pub fn run() {
                 let _ = win.set_shadow(false);
             }
 
-            let quit_item = tauri::menu::MenuItem::with_id(
+            let about_item = tauri::menu::MenuItem::with_id(
                 app,
-                "quit",
-                "Quit clowder",
+                "about",
+                "About Clowder",
                 true,
                 None::<&str>,
             )?;
-            let menu = tauri::menu::Menu::with_items(app, &[&quit_item])?;
+            let separator = tauri::menu::PredefinedMenuItem::separator(app)?;
+            let quit_item = tauri::menu::MenuItem::with_id(
+                app,
+                "quit",
+                "Quit Clowder",
+                true,
+                None::<&str>,
+            )?;
+            let menu = tauri::menu::Menu::with_items(app, &[&about_item, &separator, &quit_item])?;
 
             let (row, _, _) = anim_config("idle", 0);
             let initial_icon = make_icon(&sheet, row, 0);
@@ -778,10 +816,11 @@ pub fn run() {
                 .tooltip("clowder")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| {
-                    if event.id().as_ref() == "quit" {
-                        app.exit(0);
-                    }
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "quit" => app.exit(0),
+                    #[cfg(target_os = "macos")]
+                    "about" => show_about_dialog(),
+                    _ => {}
                 })
                 .on_tray_icon_event({
                     let tray_rect_clone = tray_rect_for_handler;
