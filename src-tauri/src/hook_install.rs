@@ -89,10 +89,14 @@ fn install_in(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 fn merge_settings(settings_path: &Path, hook_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let original_text = fs::read_to_string(settings_path).unwrap_or_default();
-    let mut settings: Value = if original_text.trim().is_empty() {
+    // Strip a UTF-8 BOM if present. PowerShell 5.1's `Set-Content -Encoding utf8`
+    // and various Windows editors prepend `EF BB BF`, which serde_json refuses
+    // as a JSON prefix — without this the merge silently no-ops on those files.
+    let parse_text = original_text.strip_prefix('\u{FEFF}').unwrap_or(&original_text);
+    let mut settings: Value = if parse_text.trim().is_empty() {
         json!({})
     } else {
-        match serde_json::from_str(&original_text) {
+        match serde_json::from_str(parse_text) {
             Ok(v) => v,
             Err(_) => {
                 eprintln!("clowder: ~/.claude/settings.json is not valid JSON; skipping hook merge");
@@ -287,6 +291,39 @@ mod tests {
         assert_eq!(stop.len(), 1, "stale + new produced {} entries", stop.len());
         let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(!cmd.contains("/old/path/"), "stale entry not removed: {cmd}");
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn handles_utf8_bom_prefixed_settings_json() {
+        // Regression: PowerShell 5.1's `Set-Content -Encoding utf8` writes a
+        // UTF-8 BOM, which serde_json rejects as a prefix. Without BOM
+        // stripping the merge silently no-ops and hook entries are never
+        // written even though the hook .py files do get created.
+        let home = unique_tmp("bom");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        let body = "{\n    \"theme\": \"dark\",\n    \"hooks\": {}\n}\n";
+        let with_bom = format!("\u{FEFF}{body}");
+        fs::write(home.join(".claude/settings.json"), with_bom).unwrap();
+
+        install_in(&home).unwrap();
+
+        let after =
+            fs::read_to_string(home.join(".claude/settings.json")).unwrap();
+        assert!(
+            !after.starts_with('\u{FEFF}'),
+            "rewrite should drop the BOM"
+        );
+        let settings: Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(settings["theme"], "dark", "unrelated key dropped");
+        for event in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"] {
+            assert_eq!(
+                settings["hooks"][event].as_array().unwrap().len(),
+                1,
+                "{event} entry missing — BOM still blocking merge"
+            );
+        }
 
         let _ = fs::remove_dir_all(&home);
     }
