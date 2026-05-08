@@ -72,11 +72,25 @@ pub type StateMap = Arc<Mutex<HashMap<String, SessionState>>>;
 // (pos_x, pos_y, size_w, size_h) in physical pixels
 pub type TrayRectState = Arc<Mutex<Option<(f64, f64, f64, f64)>>>;
 
+/// Convert a working directory path into the directory name Claude Code uses
+/// under ~/.claude/projects. Observed on Windows that `:`, `\`, and `.` all
+/// become `-` (e.g. `D:\Projects\.claude\foo` → `D--Projects--claude-foo`);
+/// macOS already needed `/` → `-`. Treat all four the same on every OS so the
+/// algorithm is platform-agnostic.
+fn project_dir_name(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| match c {
+            ':' | '\\' | '/' | '.' => '-',
+            _ => c,
+        })
+        .collect()
+}
+
 /// Find the session UUID currently active for a given working directory.
-/// Claude Code stores conversations at ~/.claude/projects/<cwd-with-/-as->/><session-id>.jsonl.
+/// Claude Code stores conversations at ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl.
 /// The most recently modified JSONL in that directory is the active conversation.
 fn find_active_session_id(cwd: &str) -> Option<String> {
-    let proj_dir_name = cwd.replace('/', "-");
+    let proj_dir_name = project_dir_name(cwd);
     let proj_dir = dirs::home_dir()?
         .join(".claude")
         .join("projects")
@@ -227,6 +241,16 @@ fn context_window_for_model(model: Option<&str>, observed: u64) -> u64 {
 const FRAME_SIZE: u32 = 32;
 const SPRITE_BYTES: &[u8] = include_bytes!("../../public/Cat Sprite Sheet.png");
 
+/// Output icon size for the system tray. macOS menu bar handles 64×64 well
+/// (DWM scales for retina). Windows tray draws at 16/24/32 logical px; we
+/// feed it a slightly oversized 40 so high-DPI taskbars get a crisper cat
+/// without the source being so big that nearest-neighbor downscaling muddies
+/// the pixel art.
+#[cfg(target_os = "windows")]
+const TRAY_ICON_SIZE: u32 = 72;
+#[cfg(not(target_os = "windows"))]
+const TRAY_ICON_SIZE: u32 = 64;
+
 pub fn sessions_dir() -> PathBuf {
     dirs::home_dir()
         .expect("no home dir")
@@ -317,6 +341,20 @@ pub fn emit_update(
     let _ = app.emit("sessions-update", &list);
 }
 
+/// Y position for a window anchored to the tray icon, in physical pixels.
+/// macOS menu bar sits at the top of the screen, so windows hang below the
+/// tray rect. Windows taskbar typically sits at the bottom, so windows must
+/// rise above the tray rect to stay on-screen. (Side-mounted Windows taskbars
+/// are not yet handled — they'll fall back to "above" which is wrong but
+/// keeps the window on-screen.)
+fn anchor_y(tray_y: f64, tray_h: f64, win_h_phys: f64, margin_phys: f64) -> f64 {
+    if cfg!(target_os = "windows") {
+        (tray_y - win_h_phys - margin_phys).max(0.0)
+    } else {
+        tray_y + tray_h + margin_phys
+    }
+}
+
 /// Convert tray event rect position/size to physical pixel coordinates.
 fn phys_coords(
     pos: tauri::Position,
@@ -350,7 +388,34 @@ fn show_without_focus(win: &tauri::WebviewWindow) {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows: show the window without activating it. ShowWindow(SW_SHOWNOACTIVATE)
+/// keeps keyboard focus on the previously active app, and SetWindowPos with
+/// SWP_NOACTIVATE pins it topmost without stealing focus.
+#[cfg(target_os = "windows")]
+fn show_without_focus(win: &tauri::WebviewWindow) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, ShowWindow, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SW_SHOWNOACTIVATE,
+    };
+    if let Ok(hwnd) = win.hwnd() {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            );
+        }
+    } else {
+        let _ = win.show();
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn show_without_focus(win: &tauri::WebviewWindow) {
     let _ = win.show();
 }
@@ -442,8 +507,9 @@ fn trigger_bubble(
         if let Some((px, py, sw, sh)) = stored_rect {
             let scale = bubble.scale_factor().unwrap_or(2.0);
             let bubble_w_phys = 260.0 * scale;
+            let bubble_h_phys = height * scale;
             let x = (px + sw / 2.0 - bubble_w_phys / 2.0).max(0.0);
-            let y = py + sh + 8.0 * scale;
+            let y = anchor_y(py, sh, bubble_h_phys, 8.0 * scale);
             let _ = bubble.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
         }
 
@@ -486,7 +552,7 @@ fn make_icon(sheet: &DynamicImage, row: u32, col: u32) -> TauriImage<'static> {
     let crop_h = max_y.saturating_sub(min_y).max(1);
 
     let cropped = sub.crop_imm(min_x, min_y, crop_w, crop_h);
-    let scaled = cropped.resize_exact(64, 64, FilterType::Nearest);
+    let scaled = cropped.resize_exact(TRAY_ICON_SIZE, TRAY_ICON_SIZE, FilterType::Nearest);
     let out = scaled.to_rgba8();
     let (ow, oh) = out.dimensions();
     TauriImage::new_owned(out.into_raw(), ow, oh)
@@ -583,6 +649,7 @@ async fn animation_loop(
 
         let icon = make_icon(&sheet, row, current_frame);
         let _ = tray.set_icon(Some(icon));
+        #[cfg(target_os = "macos")]
         let _ = tray.set_icon_as_template(true);
     }
 }
@@ -662,9 +729,16 @@ pub fn run() {
 
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.hide();
+                // Windows DWM draws a shadow at the full window rect even with
+                // decorations off, which appears as an outline around the empty
+                // area outside the popup card. Disable per-window on Windows.
+                #[cfg(target_os = "windows")]
+                let _ = win.set_shadow(false);
             }
             if let Some(win) = app.get_webview_window("bubble") {
                 let _ = win.hide();
+                #[cfg(target_os = "windows")]
+                let _ = win.set_shadow(false);
             }
 
             let quit_item = tauri::menu::MenuItem::with_id(
@@ -735,8 +809,9 @@ pub fn run() {
                                     let (pos_x, pos_y, sz_w, sz_h) =
                                         phys_coords(rect.position, rect.size, scale);
                                     let win_width_phys = 320.0 * scale;
+                                    let win_height_phys = 480.0 * scale;
                                     let x = (pos_x + sz_w / 2.0 - win_width_phys / 2.0).max(0.0);
-                                    let y = pos_y + sz_h;
+                                    let y = anchor_y(pos_y, sz_h, win_height_phys, 0.0);
                                     let _ = win.set_position(tauri::PhysicalPosition::new(
                                         x as i32, y as i32,
                                     ));

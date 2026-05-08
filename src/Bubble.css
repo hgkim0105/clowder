@@ -87,3 +87,15 @@ body,
   color: rgba(255, 255, 255, 0.4);
   white-space: nowrap;
 }
+
+/* Windows: bubble appears ABOVE the tray, so the arrow needs to sit at the
+   bottom of the bubble and point DOWN. column-reverse moves the arrow visually
+   below the body; swapping border-bottom→border-top flips the triangle. */
+:root[data-platform="windows"] .bubble-wrapper {
+  flex-direction: column-reverse;
+}
+
+:root[data-platform="windows"] .bubble-arrow {
+  border-bottom: none;
+  border-top: 8px solid rgba(36, 36, 40, 0.96);
+}

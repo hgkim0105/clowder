@@ -10,6 +10,10 @@
     "core:event:allow-emit",
     "core:event:allow-unlisten",
     "core:webview:default",
-    "core:window:default"
+    "core:window:default",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-set-position",
+    "core:window:allow-set-size"
   ]
 }
