@@ -13,6 +13,16 @@ body,
   overflow: hidden;
 }
 
+/* Windows: tray is at the bottom edge so we anchor the popup window above the
+   tray. The window itself is 320×480 (transparent), but the actual content
+   card grows from the top, leaving a tall gap between card and taskbar. Stick
+   the card to the bottom of the window so it lands just above the taskbar. */
+:root[data-platform="windows"] #root {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
 .popup {
   display: flex;
   flex-direction: column;
