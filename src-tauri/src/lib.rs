@@ -1,3 +1,4 @@
+mod hook_install;
 mod watcher;
 
 #[cfg(target_os = "macos")]
@@ -697,6 +698,8 @@ fn get_sessions(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    hook_install::ensure_hooks_installed();
+
     let session_map: SessionMap = Arc::new(Mutex::new(load_sessions()));
     let state_map: StateMap = Arc::new(Mutex::new(HashMap::new()));
     let tray_rect_state: TrayRectState = Arc::new(Mutex::new(None));
