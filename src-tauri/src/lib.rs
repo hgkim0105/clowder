@@ -717,6 +717,10 @@ pub fn run() {
     );
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(session_map.clone())
         .manage(state_map.clone())
         .manage(tray_rect_state.clone())
@@ -726,6 +730,18 @@ pub fn run() {
 
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // Enable launch-on-login on first run. Idempotent: if already enabled
+            // (or the user explicitly disabled it via system settings), this is a
+            // no-op. macOS writes a LaunchAgent plist; Windows writes the Run
+            // registry key — both via tauri-plugin-autostart.
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let autostart = app.autolaunch();
+                if !autostart.is_enabled().unwrap_or(false) {
+                    let _ = autostart.enable();
+                }
+            }
 
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.hide();
