@@ -655,7 +655,7 @@ async fn animation_loop(
     }
 }
 
-const ABOUT_BODY: &str = "Claude Code cat companion\n\nWatches your Claude Code sessions\nand brings them to life in the menu bar.\n\nBuilt with Tauri + Rust + React\nby a non-Rust developer + Claude 🐱";
+const ABOUT_BODY: &str = "Claude Code cat companion\n\nWatches your Claude Code sessions\nand brings them to life in the menu bar.\n\nBuilt with Tauri + Rust + React\nby @hgkim0105 + Claude 🐱";
 
 fn about_title() -> String {
     format!("Clowder {}", env!("CARGO_PKG_VERSION"))
