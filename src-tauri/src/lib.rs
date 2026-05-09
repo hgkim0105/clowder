@@ -655,9 +655,10 @@ async fn animation_loop(
     }
 }
 
-#[tauri::command]
-fn quit_app(app: AppHandle) {
-    app.exit(0);
+const ABOUT_BODY: &str = "Claude Code cat companion\n\nWatches your Claude Code sessions\nand brings them to life in the menu bar.\n\nBuilt with Tauri + Rust + React\nby a non-Rust developer + Claude 🐱";
+
+fn about_title() -> String {
+    format!("Clowder {}", env!("CARGO_PKG_VERSION"))
 }
 
 #[cfg(target_os = "macos")]
@@ -666,14 +667,37 @@ fn show_about_dialog() {
     unsafe {
         let cls = objc::runtime::Class::get("NSAlert").unwrap();
         let alert: *mut Object = msg_send![cls, new];
-        let title = cocoa_string("Clowder 0.1.3");
-        let msg = cocoa_string(
-            "Claude Code cat companion\n\nWatches your Claude Code sessions\nand brings them to life in the menu bar.\n\nBuilt with Tauri + Rust + React\nby a non-Rust developer + Claude 🐱",
-        );
+        let title = cocoa_string(&about_title());
+        let msg = cocoa_string(ABOUT_BODY);
         let _: () = msg_send![alert, setMessageText: title];
         let _: () = msg_send![alert, setInformativeText: msg];
         let _: () = msg_send![alert, runModal];
     }
+}
+
+#[cfg(target_os = "windows")]
+fn show_about_dialog() {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+
+    // MessageBoxW expects a null-terminated UTF-16 buffer for both strings.
+    // The buffers must outlive the call, so bind them before producing the
+    // PCWSTR pointers.
+    let title_w: Vec<u16> = about_title().encode_utf16().chain(std::iter::once(0)).collect();
+    let body_w: Vec<u16> = ABOUT_BODY.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(body_w.as_ptr()),
+            PCWSTR(title_w.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn show_about_dialog() {
+    eprintln!("{}\n\n{}", about_title(), ABOUT_BODY);
 }
 
 #[cfg(target_os = "macos")]
@@ -757,7 +781,7 @@ pub fn run() {
         .manage(session_map.clone())
         .manage(state_map.clone())
         .manage(tray_rect_state.clone())
-        .invoke_handler(tauri::generate_handler![get_sessions, quit_app])
+        .invoke_handler(tauri::generate_handler![get_sessions])
         .setup(move |app| {
             let _ = fs::create_dir_all(state_dir());
 
@@ -818,7 +842,6 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "quit" => app.exit(0),
-                    #[cfg(target_os = "macos")]
                     "about" => show_about_dialog(),
                     _ => {}
                 })

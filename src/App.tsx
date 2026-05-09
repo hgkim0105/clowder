@@ -1,5 +1,4 @@
 import { useEffect, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { useSessions } from "./hooks/useSessions";
 import type { SessionStats, SessionWithState } from "./types";
 import "./App.css";
@@ -137,9 +136,6 @@ export default function App() {
         ) : (
           sessions.map((s) => <SessionRow key={s.info.sessionId} session={s} />)
         )}
-      </div>
-      <div className="footer">
-        <button className="quit-btn" onClick={() => invoke("quit_app")}>Quit Clowder</button>
       </div>
     </div>
   );

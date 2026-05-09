@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const HOOK_TEMPLATE: &str = r#"#!/usr/bin/env python3
 import sys, json, time, pathlib
@@ -159,6 +159,7 @@ fn merge_settings(settings_path: &Path, hook_dir: &Path) -> Result<(), Box<dyn s
 mod tests {
     use super::*;
     use std::env;
+    use std::path::PathBuf;
 
     fn unique_tmp(label: &str) -> PathBuf {
         let mut p = env::temp_dir();
