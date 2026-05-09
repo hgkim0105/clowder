@@ -655,63 +655,16 @@ async fn animation_loop(
     }
 }
 
-const ABOUT_BODY: &str = "Claude Code cat companion\n\nWatches your Claude Code sessions\nand brings them to life in the menu bar.\n\nBuilt with Tauri + Rust + React\nby @hgkim0105 + Claude 🐱";
-
-fn about_title() -> String {
-    format!("Clowder {}", env!("CARGO_PKG_VERSION"))
-}
-
-#[cfg(target_os = "macos")]
-fn show_about_dialog() {
-    use objc::runtime::Object;
-    unsafe {
-        let cls = objc::runtime::Class::get("NSAlert").unwrap();
-        let alert: *mut Object = msg_send![cls, new];
-        let title = cocoa_string(&about_title());
-        let msg = cocoa_string(ABOUT_BODY);
-        let _: () = msg_send![alert, setMessageText: title];
-        let _: () = msg_send![alert, setInformativeText: msg];
-        let _: () = msg_send![alert, runModal];
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn show_about_dialog() {
-    use windows::core::PCWSTR;
-    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
-
-    // MessageBoxW expects a null-terminated UTF-16 buffer for both strings.
-    // The buffers must outlive the call, so bind them before producing the
-    // PCWSTR pointers.
-    let title_w: Vec<u16> = about_title().encode_utf16().chain(std::iter::once(0)).collect();
-    let body_w: Vec<u16> = ABOUT_BODY.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        MessageBoxW(
-            None,
-            PCWSTR(body_w.as_ptr()),
-            PCWSTR(title_w.as_ptr()),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn show_about_dialog() {
-    eprintln!("{}\n\n{}", about_title(), ABOUT_BODY);
-}
-
-#[cfg(target_os = "macos")]
-fn cocoa_string(s: &str) -> *mut objc::runtime::Object {
-    use objc::runtime::Object;
-    unsafe {
-        let cls = objc::runtime::Class::get("NSString").unwrap();
-        let bytes = s.as_ptr() as *const std::os::raw::c_void;
-        let ns_str: *mut Object =
-            msg_send![cls, alloc];
-        let ns_str: *mut Object =
-            msg_send![ns_str, initWithBytes:bytes length:s.len() encoding:4u64];
-        ns_str
-    }
+// The About dialog lives in its own webview window (label "about") so the
+// content is plain HTML — gives us a real clickable link to the author and
+// repo without dropping into Win32 TaskDialog or NSAttributedString.
+fn show_about_dialog(app: &AppHandle) {
+    let Some(win) = app.get_webview_window("about") else {
+        eprintln!("clowder: about window not found");
+        return;
+    };
+    let _ = win.show();
+    let _ = win.set_focus();
 }
 
 #[tauri::command]
@@ -778,6 +731,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_opener::init())
         .manage(session_map.clone())
         .manage(state_map.clone())
         .manage(tray_rect_state.clone())
@@ -813,6 +767,11 @@ pub fn run() {
                 #[cfg(target_os = "windows")]
                 let _ = win.set_shadow(false);
             }
+            if let Some(win) = app.get_webview_window("about") {
+                let _ = win.hide();
+                #[cfg(target_os = "windows")]
+                let _ = win.set_shadow(false);
+            }
 
             let about_item = tauri::menu::MenuItem::with_id(
                 app,
@@ -842,7 +801,7 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "quit" => app.exit(0),
-                    "about" => show_about_dialog(),
+                    "about" => show_about_dialog(app),
                     _ => {}
                 })
                 .on_tray_icon_event({

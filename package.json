@@ -1,7 +1,7 @@
 {
   "name": "clowder",
   "private": true,
-  "version": "0.1.6",
+  "version": "0.1.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-opener": "^2.5.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
@@ -18,8 +19,8 @@
     "@tauri-apps/cli": "^2",
     "@types/react": "^18.3.1",
     "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.1",
     "typescript": "^5.5.3",
-    "vite": "^5.4.8",
-    "@vitejs/plugin-react": "^4.3.1"
+    "vite": "^5.4.8"
   }
 }

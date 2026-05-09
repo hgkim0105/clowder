@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import App from "./App";
+import About from "./About";
 import Bubble from "./Bubble";
 
 const label = getCurrentWebviewWindow().label;
@@ -17,6 +18,6 @@ document.documentElement.setAttribute(
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    {label === "bubble" ? <Bubble /> : <App />}
+    {label === "bubble" ? <Bubble /> : label === "about" ? <About /> : <App />}
   </React.StrictMode>
 );

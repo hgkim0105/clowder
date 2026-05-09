@@ -1,6 +1,6 @@
 [package]
 name = "clowder"
-version = "0.1.6"
+version = "0.1.7"
 description = "Claude Code cat companion overlay"
 authors = []
 edition = "2021"
@@ -15,6 +15,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
 tauri-plugin-autostart = "2"
+tauri-plugin-opener = "2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
