@@ -15,6 +15,96 @@ Both ship together because (a) auto-update without signing is fragile on macOS (
 - In-app "update available" UI / changelog viewer. Silent install means we don't need it for v0.2.0; can add later if user feedback wants it.
 - Roll-back / staged rollouts. GitHub Releases is fine for our scale.
 
+---
+
+## What hgkim0105 must prepare personally
+
+These steps require a real person — payment, identity verification, or access to personal accounts — and **cannot be done by Claude Code or the CI**. Block on these before opening the implementation PR. Total cash outlay roughly **$300–500 first year**, recurring annually.
+
+### A. Decisions (do these first — they shape everything below)
+
+- [ ] **Identity to sign as.** Personal name (`hgkim0105` / your legal name) or a registered business entity? Both work, but the name shows in macOS Gatekeeper / Windows installer "Verified publisher" labels and cannot be changed without re-issuing certs. Personal is fine for an indie app.
+- [ ] **Windows cert tier.** OV (~$200–400, SmartScreen warns until ~3 000 downloads) vs EV (~$400–700, no warning from day 1, but ships on a USB HSM and needs a remote-signing setup like Azure Key Vault). **Recommended: OV first year.**
+- [ ] **Windows cert vendor.** Sectigo via SSL.com / Certum / DigiCert / GoGetSSL. SSL.com and Certum are the cheapest legit options. Pick one before starting paperwork — switching mid-application is annoying.
+- [ ] **Linux support yes/no.** If yes, the same updater plumbing works for AppImage but adds another runner to the CI matrix. Default for now: **no**.
+
+### B. Apple Developer Program — for macOS signing + notarization
+
+Total: ~$99/yr, ~1–2 days to set up.
+
+- [ ] **Enroll in the Apple Developer Program** at <https://developer.apple.com/programs/enroll/> using your Apple ID. $99/yr. Approval is usually within 24–48 h; can take longer if Apple flags ID verification.
+- [ ] After approval, log in to <https://developer.apple.com/account> → **Certificates, IDs & Profiles** → create a **"Developer ID Application"** certificate.
+  - Generate a CSR locally first (Keychain Access → Certificate Assistant → Request a Certificate from a Certificate Authority).
+  - Upload CSR, download the `.cer`, double-click to install into Keychain.
+  - In Keychain Access, find the certificate, right-click → **Export** → save as `developer-id.p12` with a strong password. This `.p12` is what we'll feed CI.
+- [ ] **Create an app-specific password** at <https://appleid.apple.com> → **Sign-In and Security** → **App-Specific Passwords**. Label it `clowder-notarization`. Save the generated password — it's shown once.
+- [ ] **Note your Team ID** (10-char string, e.g. `ABCDE12345`) from <https://developer.apple.com/account> → **Membership**.
+- [ ] **Save into 1Password** under `Clowder / Apple signing`:
+  - Apple ID email
+  - App-specific password (NOT your Apple ID login password)
+  - `.p12` file + its export password
+  - Team ID
+  - "Developer ID Application: <Your Name> (<TeamID>)" string — this is your `APPLE_SIGNING_IDENTITY` value, copy-paste exact format
+
+### C. Windows code signing certificate — for Authenticode signing
+
+Total: ~$200–400/yr (OV), ~1–10 days depending on vendor and how fast you complete identity verification.
+
+- [ ] **Buy the cert** from your chosen vendor. Personal-name certs need only government ID; business certs additionally need a DUNS number.
+- [ ] Complete identity verification (typically a notarized form upload OR a video call OR a phone callback to a number listed in a public directory — varies by vendor).
+- [ ] Once issued, **download the `.pfx`** (or generate a CSR locally and have them issue against it — vendor flow varies). Set a strong export password during this step.
+- [ ] **Save into 1Password** under `Clowder / Windows signing`:
+  - `.pfx` file (treat as a critical secret — anyone with this file + password can sign as you)
+  - `.pfx` password
+  - Vendor's portal login (for renewal next year)
+  - Cert expiry date — also add a **calendar reminder 30 days before expiry**.
+
+### D. Updater signing key — for auto-update artifact verification
+
+Total: $0, 5 minutes, but **the most important thing not to lose**.
+
+- [ ] On your local machine, run:
+  ```bash
+  npx @tauri-apps/cli signer generate -w ~/.tauri/clowder-updater.key
+  ```
+  Choose a strong passphrase when prompted. This produces `clowder-updater.key` (private) and `clowder-updater.key.pub` (public).
+- [ ] **Save into 1Password** under `Clowder / Updater signing key`:
+  - Full contents of `clowder-updater.key` (the password-protected private key text)
+  - The passphrase you set
+  - Full contents of `clowder-updater.key.pub` (this one is fine to commit publicly, it goes into `tauri.conf.json`)
+- [ ] **Second backup** to an encrypted USB drive or your personal encrypted cloud. **If this key is ever lost, every Clowder install on the auto-update channel becomes a dead end** — there is no recovery path other than asking every user to manually reinstall.
+
+### E. GitHub repo secrets — paste-only, but only you can do it
+
+Once B/C/D are done, you'll need to paste these into <https://github.com/hgkim0105/clowder/settings/secrets/actions>. Claude Code cannot do this for you (no access to repo settings). Each secret is the name on the left, value on the right:
+
+**For the updater (D):**
+- [ ] `TAURI_SIGNING_PRIVATE_KEY` — full text of `clowder-updater.key`
+- [ ] `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — passphrase from D
+
+**For macOS signing (B):**
+- [ ] `APPLE_CERTIFICATE` — base64-encoded `.p12`. Run on macOS: `base64 -i developer-id.p12 | pbcopy`
+- [ ] `APPLE_CERTIFICATE_PASSWORD` — `.p12` export password
+- [ ] `APPLE_SIGNING_IDENTITY` — `"Developer ID Application: <Your Name> (<TeamID>)"` literal
+- [ ] `APPLE_ID` — Apple ID email
+- [ ] `APPLE_PASSWORD` — app-specific password (NOT Apple ID password)
+- [ ] `APPLE_TEAM_ID` — 10-char team ID
+
+**For Windows signing (C):**
+- [ ] `WINDOWS_CERTIFICATE` — base64-encoded `.pfx`. On Windows PowerShell: `[Convert]::ToBase64String([IO.File]::ReadAllBytes("codesign.pfx")) | Set-Clipboard`
+- [ ] `WINDOWS_CERTIFICATE_PASSWORD` — `.pfx` export password
+
+### F. Sanity check before pinging Claude to start implementation
+
+- [ ] All checkboxes in A–E ticked.
+- [ ] You have a clean macOS box (or VM) and a clean Windows VM ready for the beta.1 → beta.2 verification round-trip.
+- [ ] Calendar reminders set: Apple cert renewal (1 yr from issuance), Windows cert renewal (1 yr).
+- [ ] Budget approved (or at least mentally committed): ~$300–500 first year, recurring.
+
+When all of the above is done, message Claude with "사이닝/업데이트 구현 진행" and we'll start from Part 1 below.
+
+---
+
 ## Cutover plan
 
 | Version       | Purpose                                                                             |
