@@ -1,4 +1,5 @@
 mod hook_install;
+mod notify_icon_cleanup;
 mod watcher;
 
 #[cfg(target_os = "macos")]
@@ -706,6 +707,7 @@ fn get_sessions(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     hook_install::ensure_hooks_installed();
+    notify_icon_cleanup::cleanup_orphan_notify_icons();
 
     let session_map: SessionMap = Arc::new(Mutex::new(load_sessions()));
     let state_map: StateMap = Arc::new(Mutex::new(HashMap::new()));
