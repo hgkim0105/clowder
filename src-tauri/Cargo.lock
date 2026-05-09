@@ -479,6 +479,7 @@ version = "0.1.20"
 dependencies = [
  "dirs 5.0.1",
  "image",
+ "libc",
  "notify",
  "objc",
  "serde",

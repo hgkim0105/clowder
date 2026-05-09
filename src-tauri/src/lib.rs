@@ -268,6 +268,148 @@ pub fn state_dir() -> PathBuf {
         .join("state")
 }
 
+/// True if a process with this PID currently exists. Used to filter ghost
+/// session files left behind by Claude Code processes that died without
+/// cleaning `~/.claude/sessions/<pid>.json` (e.g. a system reboot or a kill).
+///
+/// Caveat: this check is subject to PID reuse — after a reboot the OS may
+/// reassign the same numeric PID to an unrelated process, in which case a
+/// ghost entry would still pass. In practice the window is bounded because
+/// Claude Code itself sweeps its own session dir on startup, and the user
+/// reported the reboot case as the only symptom.
+#[cfg(target_os = "windows")]
+fn pid_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        if handle.is_invalid() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let alive = GetExitCodeProcess(handle, &mut code).is_ok() && code == STILL_ACTIVE;
+        let _ = CloseHandle(handle);
+        alive
+    }
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // kill(pid, 0) is the portable POSIX liveness probe: 0 = signal could be
+    // delivered (alive), -1/EPERM = process exists but we lack permission to
+    // signal it (still alive), -1/ESRCH = no such process (dead).
+    let r = unsafe { libc::kill(pid as i32, 0) };
+    if r == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(any(target_os = "windows", unix)))]
+fn pid_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Wall-clock time of the current boot, in epoch ms. Used to defeat PID reuse:
+/// any session whose `started_at` predates the current boot cannot be ours,
+/// regardless of whether some unrelated process now holds the same PID.
+///
+/// Returns `None` on platforms where we don't know how to fetch boot time;
+/// callers should fall back to PID-only checks in that case.
+#[cfg(target_os = "windows")]
+fn boot_time_ms() -> Option<u64> {
+    use windows::Win32::System::SystemInformation::GetTickCount64;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    let uptime_ms = unsafe { GetTickCount64() };
+    Some(now_ms.saturating_sub(uptime_ms))
+}
+
+#[cfg(target_os = "linux")]
+fn boot_time_ms() -> Option<u64> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    let text = fs::read_to_string("/proc/uptime").ok()?;
+    let secs: f64 = text.split_whitespace().next()?.parse().ok()?;
+    Some(now_ms.saturating_sub((secs * 1000.0) as u64))
+}
+
+#[cfg(target_os = "macos")]
+fn boot_time_ms() -> Option<u64> {
+    // sysctl kern.boottime returns a `struct timeval` (sec + usec since epoch).
+    #[repr(C)]
+    struct Timeval {
+        tv_sec: libc::time_t,
+        tv_usec: libc::suseconds_t,
+    }
+    let mut tv = Timeval { tv_sec: 0, tv_usec: 0 };
+    let mut size = std::mem::size_of::<Timeval>();
+    let name = b"kern.boottime\0";
+    let ret = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr() as *const _,
+            &mut tv as *mut _ as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    Some((tv.tv_sec as u64) * 1000 + (tv.tv_usec as u64) / 1000)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+fn boot_time_ms() -> Option<u64> { None }
+
+/// A session is dead if its PID is gone OR its `started_at` predates this boot.
+/// The boot-time check defeats PID reuse: after a reboot the OS may reassign
+/// an old Claude PID to an unrelated live process; PID liveness alone would
+/// then keep the ghost. `started_at < boot_time` is a stronger signal — a
+/// process that started before this boot definitely isn't running now.
+fn is_session_dead(info: &SessionInfo) -> bool {
+    if !pid_alive(info.pid) {
+        return true;
+    }
+    if let Some(boot_ms) = boot_time_ms() {
+        if info.started_at < boot_ms {
+            return true;
+        }
+    }
+    false
+}
+
+/// State ids that "belong" to a currently live session. Includes each live
+/// session's own `session_id` plus, for sole-occupant cwds, the JSONL-resolved
+/// active conversation id (mirrors `find_recent_state`'s fallback policy).
+fn compute_live_state_ids(
+    sessions: &HashMap<String, SessionInfo>,
+) -> std::collections::HashSet<String> {
+    let mut ids: std::collections::HashSet<String> = sessions.keys().cloned().collect();
+    let mut by_cwd: HashMap<&str, usize> = HashMap::new();
+    for info in sessions.values() {
+        *by_cwd.entry(info.cwd.as_str()).or_insert(0) += 1;
+    }
+    for info in sessions.values() {
+        if by_cwd.get(info.cwd.as_str()) == Some(&1) {
+            if let Some(active) = find_active_session_id(&info.cwd) {
+                ids.insert(active);
+            }
+        }
+    }
+    ids
+}
+
 pub fn load_sessions() -> HashMap<String, SessionInfo> {
     let mut map = HashMap::new();
     let dir = sessions_dir();
@@ -285,9 +427,32 @@ pub fn load_sessions() -> HashMap<String, SessionInfo> {
         let Ok(info) = serde_json::from_str::<SessionInfo>(&content) else {
             continue;
         };
+        if is_session_dead(&info) {
+            continue;
+        }
         map.insert(info.session_id.clone(), info);
     }
     map
+}
+
+/// Delete `~/.claude/sessions/*.json` entries whose owning process is dead
+/// (PID gone or `started_at` predates this boot). Runs at startup and from
+/// the periodic sweep so ghost files left by reboots/crashes get physically
+/// cleaned, not just hidden by `load_sessions`'s filter.
+pub fn prune_dead_session_files() {
+    let dir = sessions_dir();
+    let Ok(entries) = fs::read_dir(&dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&path) else { continue };
+        let Ok(info) = serde_json::from_str::<SessionInfo>(&content) else { continue };
+        if is_session_dead(&info) {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 fn load_state(session_id: &str) -> Option<SessionState> {
@@ -708,6 +873,7 @@ fn get_sessions(
 pub fn run() {
     hook_install::ensure_hooks_installed();
     notify_icon_cleanup::cleanup_orphan_notify_icons();
+    prune_dead_session_files();
 
     let session_map: SessionMap = Arc::new(Mutex::new(load_sessions()));
     let state_map: StateMap = Arc::new(Mutex::new(HashMap::new()));
@@ -886,6 +1052,33 @@ pub fn run() {
             let sheet_clone = sheet.clone();
             tauri::async_runtime::spawn(async move {
                 animation_loop(app_for_anim, tray, stm, sess, tr, sheet_clone).await;
+            });
+
+            // Periodic sweep: catches Claude Code processes that died without a
+            // file event firing (mid-PreToolUse crash, kill -9). Every 30 s we
+            // re-scan ~/.claude/sessions/, drop ghost rows, and prune any state
+            // map entries whose owning session is no longer live. The watcher
+            // already handles normal create/delete events; this is the safety
+            // net for silent disappearances.
+            let app_for_sweep = app.handle().clone();
+            let sess_for_sweep = session_map.clone();
+            let states_for_sweep = state_map.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(30));
+                tick.tick().await; // skip the immediate first tick
+                loop {
+                    tick.tick().await;
+                    prune_dead_session_files();
+                    let fresh = load_sessions();
+                    let live_ids = compute_live_state_ids(&fresh);
+                    {
+                        let mut sess_guard = sess_for_sweep.lock().unwrap();
+                        *sess_guard = fresh;
+                        let mut states_guard = states_for_sweep.lock().unwrap();
+                        states_guard.retain(|id, _| live_ids.contains(id));
+                        emit_update(&app_for_sweep, &sess_guard, &states_guard);
+                    }
+                }
             });
 
             Ok(())

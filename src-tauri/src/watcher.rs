@@ -1,4 +1,7 @@
-use crate::{SessionMap, SessionState, StateMap, emit_update, load_sessions, sessions_dir, state_dir};
+use crate::{
+    SessionMap, SessionState, StateMap, compute_live_state_ids, emit_update, load_sessions,
+    sessions_dir, state_dir,
+};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::fs;
 use std::time::Duration;
@@ -71,10 +74,15 @@ fn handle_session_event(event: &Event, sessions: &SessionMap, states: &StateMap,
     }
 
     let fresh = load_sessions();
+    let live_ids = compute_live_state_ids(&fresh);
     let mut map = sessions.lock().unwrap();
     *map = fresh;
 
-    let states_guard = states.lock().unwrap();
+    // Drop state-map entries whose owning session just disappeared, so the
+    // animation loop doesn't keep treating an orphan "working" state as a
+    // live worker (and the cat doesn't get stuck animating after a crash).
+    let mut states_guard = states.lock().unwrap();
+    states_guard.retain(|id, _| live_ids.contains(id));
     emit_update(app, &map, &states_guard);
 }
 
@@ -103,10 +111,16 @@ fn handle_state_event(event: &Event, sessions: &SessionMap, states: &StateMap, a
             continue;
         };
 
+        let sessions_guard = sessions.lock().unwrap();
+        // Ignore state writes for sessions that aren't live. Without this a
+        // stale state file from a crashed/rebooted-away Claude Code process
+        // could re-enter the map on any spurious touch and revive a ghost.
+        let live_ids = compute_live_state_ids(&sessions_guard);
+        if !live_ids.contains(&session_id) {
+            continue;
+        }
         let mut states_guard = states.lock().unwrap();
         states_guard.insert(session_id, state);
-
-        let sessions_guard = sessions.lock().unwrap();
         emit_update(app, &sessions_guard, &states_guard);
     }
 }
