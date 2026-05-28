@@ -140,6 +140,8 @@ When a session transitions to done, a 260-wide frosted-glass speech bubble appea
 
 Done states older than `DONE_FRESHNESS_SECS` (60 s) are excluded from the bubble payload and from the `working → done` transition detector, so bringing up a stale done state doesn't replay an old notification.
 
+The bubble window is click-through on Windows: `setup` calls `set_ignore_cursor_events(true)` on it. Windows doesn't honor CSS `pointer-events` for per-pixel pass-through the way macOS does, so the transparent padding around the bubble body (and the whole window while it's shown) would otherwise swallow clicks meant for the tray / taskbar icons behind it. The bubble has no interactive elements, so making the entire window ignore the cursor is safe.
+
 ## Runtime File Paths
 
 | Path | Purpose |
