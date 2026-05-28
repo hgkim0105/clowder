@@ -933,7 +933,17 @@ pub fn run() {
             if let Some(win) = app.get_webview_window("bubble") {
                 let _ = win.hide();
                 #[cfg(target_os = "windows")]
-                let _ = win.set_shadow(false);
+                {
+                    let _ = win.set_shadow(false);
+                    // Make the whole bubble window click-through. Windows does
+                    // not honor CSS pointer-events for per-pixel pass-through the
+                    // way macOS does, so the transparent padding around the bubble
+                    // body would otherwise swallow clicks meant for the tray /
+                    // taskbar icons sitting behind it. The bubble has no
+                    // interactive elements, so ignoring cursor events entirely is
+                    // safe and the right fix.
+                    let _ = win.set_ignore_cursor_events(true);
+                }
             }
             if let Some(win) = app.get_webview_window("about") {
                 let _ = win.hide();
