@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import "./Bubble.css";
@@ -42,7 +43,14 @@ export default function Bubble() {
     if (sessions.length === 0) return;
     const win = getCurrentWebviewWindow();
     const timer = setTimeout(async () => {
-      await win.hide();
+      // win.hide() is a no-op on Windows after show_without_focus (tao still
+      // thinks the window is hidden). dismiss_overlay force-hides and parks it.
+      try {
+        await invoke("dismiss_overlay");
+      } catch (err) {
+        console.error("dismiss_overlay failed", err);
+        await win.hide();
+      }
       setSessions([]);
     }, 4000);
     return () => clearTimeout(timer);

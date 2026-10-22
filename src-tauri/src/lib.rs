@@ -587,6 +587,117 @@ fn show_without_focus(win: &tauri::WebviewWindow) {
     let _ = win.show();
 }
 
+/// Hide a tray overlay so it cannot keep eating clicks after it looks gone.
+///
+/// On Windows, `show_without_focus` reveals the bubble with raw `ShowWindow`
+/// and never flips tao's VISIBLE flag. A later `win.hide()` is then a no-op:
+/// the webview clears its content, the HWND stays where the popup was, and
+/// that rectangle keeps the hit test. Force `SW_HIDE` and park the window
+/// off-screen. Show paths always reposition before revealing again.
+fn hide_overlay(win: &tauri::WebviewWindow) {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+        };
+        if let Ok(hwnd) = win.hwnd() {
+            unsafe {
+                // Move first so a failed hide still cannot cover the desktop.
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    -32000,
+                    -32000,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+                );
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+    }
+    let _ = win.hide();
+}
+
+/// `set_position` is applied on the event-loop queue. Windows show paths that
+/// call `ShowWindow` immediately must move the HWND first, or a window parked
+/// at (-32000, -32000) by `hide_overlay` appears off-screen.
+#[cfg(target_os = "windows")]
+fn place_overlay_now(win: &tauri::WebviewWindow, x: i32, y: i32) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    };
+    if let Ok(hwnd) = win.hwnd() {
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+            );
+        }
+    }
+}
+
+/// Windows hit-testing ignores CSS `pointer-events`, and `WS_EX_TRANSPARENT`
+/// on the top-level HWND does not cover the WebView2 child. The bubble has no
+/// interactive controls, so the whole tree can be click-through.
+#[cfg(target_os = "windows")]
+fn enable_overlay_click_through(win: &tauri::WebviewWindow) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindow, GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, GW_CHILD, GW_HWNDNEXT,
+        WS_EX_TRANSPARENT,
+    };
+
+    fn pierce(hwnd: windows::Win32::Foundation::HWND) {
+        unsafe {
+            let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+            let new_ex = ex | WS_EX_TRANSPARENT.0;
+            if new_ex != ex {
+                SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex as i32);
+            }
+            let mut child = match GetWindow(hwnd, GW_CHILD) {
+                Ok(child) if !child.is_invalid() => child,
+                _ => return,
+            };
+            loop {
+                pierce(child);
+                child = match GetWindow(child, GW_HWNDNEXT) {
+                    Ok(next) if !next.is_invalid() => next,
+                    _ => return,
+                };
+            }
+        }
+    }
+
+    if let Ok(hwnd) = win.hwnd() {
+        pierce(hwnd);
+    }
+}
+
+/// Bubble.tsx also hides itself, but that `win.hide()` is a no-op on Windows
+/// after `show_without_focus`. Dismiss from Rust as well so a failed or skipped
+/// frontend hide cannot leave the HWND over the tray.
+#[cfg(target_os = "windows")]
+fn schedule_bubble_dismiss(app: AppHandle) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static GEN: AtomicU64 = AtomicU64::new(0);
+    let gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    tauri::async_runtime::spawn(async move {
+        // Keep in step with the 4s timer in Bubble.tsx.
+        tokio::time::sleep(Duration::from_millis(4000)).await;
+        if GEN.load(Ordering::SeqCst) != gen {
+            return;
+        }
+        if let Some(bubble) = app.get_webview_window("bubble") {
+            hide_overlay(&bubble);
+        }
+    });
+}
+
 /// Show the speech bubble when sessions transition to done.
 fn trigger_bubble(
     app: &AppHandle,
@@ -678,9 +789,23 @@ fn trigger_bubble(
             let x = (px + sw / 2.0 - bubble_w_phys / 2.0).max(0.0);
             let y = anchor_y(py, sh, bubble_h_phys, 8.0 * scale);
             let _ = bubble.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
+            // set_position is queued. show_without_focus shows immediately, and
+            // hide_overlay parks the HWND at -32000, so place it now or the
+            // bubble flashes off-screen.
+            #[cfg(target_os = "windows")]
+            place_overlay_now(&bubble, x as i32, y as i32);
+        } else {
+            #[cfg(target_os = "windows")]
+            place_overlay_now(&bubble, 0, 0);
         }
 
         show_without_focus(&bubble);
+        #[cfg(target_os = "windows")]
+        {
+            let _ = bubble.set_ignore_cursor_events(true);
+            enable_overlay_click_through(&bubble);
+            schedule_bubble_dismiss(app_clone.clone());
+        }
         let _ = app_clone.emit("show-bubble", &done_sessions);
     });
 }
@@ -833,6 +958,16 @@ fn show_about_dialog(app: &AppHandle) {
     let _ = win.set_focus();
 }
 
+/// Frontend dismiss for the bubble (and, if ever needed, the session popup).
+/// About is excluded so this cannot park the centered dialog off-screen.
+#[tauri::command]
+fn dismiss_overlay(window: tauri::WebviewWindow) {
+    match window.label() {
+        "main" | "bubble" => hide_overlay(&window),
+        _ => {}
+    }
+}
+
 #[tauri::command]
 fn get_sessions(
     sessions: tauri::State<SessionMap>,
@@ -903,7 +1038,7 @@ pub fn run() {
         .manage(session_map.clone())
         .manage(state_map.clone())
         .manage(tray_rect_state.clone())
-        .invoke_handler(tauri::generate_handler![get_sessions])
+        .invoke_handler(tauri::generate_handler![get_sessions, dismiss_overlay])
         .setup(move |app| {
             let _ = fs::create_dir_all(state_dir());
 
@@ -923,7 +1058,7 @@ pub fn run() {
             }
 
             if let Some(win) = app.get_webview_window("main") {
-                let _ = win.hide();
+                hide_overlay(&win);
                 // Windows DWM draws a shadow at the full window rect even with
                 // decorations off, which appears as an outline around the empty
                 // area outside the popup card. Disable per-window on Windows.
@@ -931,18 +1066,17 @@ pub fn run() {
                 let _ = win.set_shadow(false);
             }
             if let Some(win) = app.get_webview_window("bubble") {
-                let _ = win.hide();
+                hide_overlay(&win);
                 #[cfg(target_os = "windows")]
                 {
                     let _ = win.set_shadow(false);
                     // Make the whole bubble window click-through. Windows does
-                    // not honor CSS pointer-events for per-pixel pass-through the
-                    // way macOS does, so the transparent padding around the bubble
-                    // body would otherwise swallow clicks meant for the tray /
-                    // taskbar icons sitting behind it. The bubble has no
-                    // interactive elements, so ignoring cursor events entirely is
-                    // safe and the right fix.
+                    // not honor CSS pointer-events, and WS_EX_TRANSPARENT on the
+                    // parent does not cover the WebView2 child, so the transparent
+                    // padding would swallow clicks meant for the tray / taskbar.
+                    // The bubble has no interactive elements.
                     let _ = win.set_ignore_cursor_events(true);
+                    enable_overlay_click_through(&win);
                 }
             }
             if let Some(win) = app.get_webview_window("about") {
@@ -1018,11 +1152,11 @@ pub fn run() {
                         {
                             if let Some(win) = app.get_webview_window("main") {
                                 if win.is_visible().unwrap_or(false) {
-                                    let _ = win.hide();
+                                    hide_overlay(&win);
                                 } else {
                                     // Hide bubble if it's showing
                                     if let Some(b) = app.get_webview_window("bubble") {
-                                        let _ = b.hide();
+                                        hide_overlay(&b);
                                     }
                                     let (pos_x, pos_y, sz_w, sz_h) =
                                         phys_coords(rect.position, rect.size, scale);
@@ -1033,6 +1167,8 @@ pub fn run() {
                                     let _ = win.set_position(tauri::PhysicalPosition::new(
                                         x as i32, y as i32,
                                     ));
+                                    #[cfg(target_os = "windows")]
+                                    place_overlay_now(&win, x as i32, y as i32);
                                     let _ = win.show();
                                     let _ = win.set_focus();
                                 }
@@ -1047,7 +1183,7 @@ pub fn run() {
                 let win_clone = win.clone();
                 win.on_window_event(move |event| {
                     if let tauri::WindowEvent::Focused(false) = event {
-                        let _ = win_clone.hide();
+                        hide_overlay(&win_clone);
                     }
                 });
             }
